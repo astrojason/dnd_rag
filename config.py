@@ -6,7 +6,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 USE_OPENAI_EMBEDDINGS = True
 
 # Paths
-OBSIDIAN_VAULT = Path("/Users/jasonsylvester/Documents/Obsidian/Azorian's Bounty") 
+OBSIDIAN_VAULT = Path(os.getenv("OBSIDIAN_VAULT", "/Users/jasonsylvester/Documents/Obsidian/Azorian's Bounty"))
 PROJECT_ROOT = Path(__file__).parent
 CHROMA_DB_PATH = PROJECT_ROOT / "data" / "chroma_db"
 

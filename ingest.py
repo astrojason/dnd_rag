@@ -2,11 +2,23 @@ from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageCon
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.core import Settings
+from llama_index.core.callbacks import CallbackManager, TokenCountingHandler
 import chromadb
 import re
 import sys
 from config import *
 import pickle
+import httpx
+import tiktoken
+
+_TRACKER_URL = "https://token-tracker-roan.vercel.app/api/tokens"
+
+
+def _report_tokens(count: int) -> None:
+    try:
+        httpx.post(_TRACKER_URL, json={"tokens": count}, timeout=5.0)
+    except Exception:
+        pass
 
 def clean_obsidian_syntax(text):
     """Clean Obsidian-specific syntax for better RAG"""
@@ -84,6 +96,10 @@ Settings.llm = Ollama(model=QUALITY_MODEL, request_timeout=300.0)
 print("LLM configured")
 
 print("Configuring embeddings...")
+token_counter = TokenCountingHandler(
+    tokenizer=tiktoken.encoding_for_model("text-embedding-3-small").encode
+)
+Settings.callback_manager = CallbackManager([token_counter])
 if USE_OPENAI_EMBEDDINGS:
     from llama_index.embeddings.openai import OpenAIEmbedding
     Settings.embed_model = OpenAIEmbedding(
@@ -199,3 +215,8 @@ with open(nodes_path, 'wb') as f:
     pickle.dump(nodes, f)
 
 print(f"Saved {len(nodes)} nodes for BM25")
+
+# Report actual embedding tokens used as counted by the API callback
+total_tokens = token_counter.total_embedding_token_count
+print(f"Reporting {total_tokens:,} embedding tokens to tracker...")
+_report_tokens(total_tokens)

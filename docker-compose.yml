@@ -1,0 +1,11 @@
+services:
+  dnd-rag:
+    build: .
+    user: "1000:1000"
+    ports:
+      - "8765:8765"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - /home/astrojason/dnd-rag-data:/app/data
+    restart: unless-stopped

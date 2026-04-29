@@ -8,10 +8,20 @@ import xMarkSvg from 'heroicons/24/outline/x-mark.svg?raw';
 import bookmarkSvg from 'heroicons/24/outline/bookmark.svg?raw';
 import checkCircleSvg from 'heroicons/24/outline/check-circle.svg?raw';
 
-const API = 'http://127.0.0.1:8765';
+const API = 'http://astroserver:8765';
+const VAULT_PATH = "/Users/jasonsylvester/Documents/Obsidian/Azorian's Bounty";
+const VAULT_NAME = VAULT_PATH.split('/').pop();
+
+function buildObsidianUrl(filePath) {
+  if (!filePath) return null;
+  // file_path in metadata is the Mac path from ingest time — strip vault prefix
+  const prefix = VAULT_PATH + '/';
+  if (!filePath.startsWith(prefix)) return null;
+  const rel = filePath.slice(prefix.length).replace(/\.md$/, '');
+  return `obsidian://open?vault=${encodeURIComponent(VAULT_NAME)}&file=${encodeURIComponent(rel)}`;
+}
 
 let isQuerying = false;
-let isIngesting = false;
 let sourcesCollapsed = false;
 let suggestions = [];
 let _wasLoaded = false;
@@ -28,7 +38,6 @@ document.getElementById('app').innerHTML = `
         <div class="status-dot" id="status-dot"></div>
         <span id="status-text">Connecting...</span>
       </div>
-      <button class="settings-btn" id="settings-btn" title="Settings">⚙</button>
     </div>
   </header>
 
@@ -234,27 +243,6 @@ document.getElementById('app').innerHTML = `
     </div>
   </div>
 
-  <div class="modal-overlay" id="settings-modal" style="display:none">
-    <div class="modal modal-settings">
-      <div class="modal-title">Settings</div>
-      <div class="settings-section">
-        <div class="settings-section-label">Index Vault</div>
-        <label class="rebuild-toggle" style="margin-bottom:12px; display:flex">
-          <input type="checkbox" id="rebuild-checkbox">
-          Full rebuild (clears existing index)
-        </label>
-        <button class="btn btn-primary" id="reindex-btn" style="width:100%">⟳ Re-index Vault</button>
-      </div>
-      <div class="ingest-log" id="ingest-log" style="display:none; max-height:260px; overflow-y:auto; margin-top:12px">
-        <div class="ingest-log-title">Progress</div>
-        <div class="ingest-log-entries" id="ingest-entries"></div>
-      </div>
-      <div class="modal-actions" style="margin-top:16px">
-        <button class="btn btn-ghost" id="settings-close">Close</button>
-      </div>
-    </div>
-  </div>
-
   <div class="modal-overlay" id="error-modal" style="display:none">
     <div class="modal modal-wide">
       <div class="modal-title">Index Error</div>
@@ -284,15 +272,11 @@ document.getElementById('app').innerHTML = `
 // ── DOM refs (resolved after innerHTML set) ────────────────────────────
 const queryInput   = document.getElementById('query-input');
 const sendBtn      = document.getElementById('send-btn');
-const reindexBtn   = document.getElementById('reindex-btn');
 const messagesEl   = document.getElementById('messages');
 const sourcesBar   = document.getElementById('sources-bar');
 const sourcesList  = document.getElementById('sources-list');
 const sourcesCount = document.getElementById('sources-count');
 const sourcesToggleBtn = document.getElementById('sources-toggle-btn');
-const ingestLog    = document.getElementById('ingest-log');
-const ingestEntries = document.getElementById('ingest-entries');
-
 const DAILY_LIMIT = 250_000;
 
 // ── Sources nav buttons ────────────────────────────────────────────────
@@ -334,15 +318,74 @@ document.getElementById('shop-modal-close').addEventListener('click', () => {
   document.getElementById('shop-modal').style.display = 'none';
 });
 
+// ── Vault FS helpers ────────────────────────────────────────────────────
+function extractSection(content, sectionName) {
+  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:^|\\n)#{1,4}\\s+${escaped}\\s*\\n([\\s\\S]*?)(?=\\n#{1,4}\\s|$)`, 'i');
+  const m = content.match(re);
+  return m ? m[1].trim() : '';
+}
+
+function extractLocationContent(content) {
+  return (
+    extractSection(content, 'Description') ||
+    extractSection(content, 'Overview') ||
+    content.slice(0, 800)
+  );
+}
+
+async function getActivePcInfo() {
+  const pcDir = `${VAULT_PATH}/02 Characters/PCs`;
+  try {
+    const entries = await invoke('read_dir', { path: pcDir });
+    const summaries = [];
+    for (const entry of entries) {
+      if (entry.is_dir || !entry.name.endsWith('.md')) continue;
+      try {
+        const content = await invoke('read_text_file', { path: entry.path });
+        if (content.includes('#inactive') || content.includes('#deceased')) continue;
+        const name = entry.name.replace('.md', '');
+        const goal = extractSection(content, 'Primary Goal') || extractSection(content, 'Goals');
+        summaries.push(goal ? `${name}: ${goal.slice(0, 200)}` : name);
+      } catch { /* skip unreadable file */ }
+    }
+    return summaries.join('\n');
+  } catch {
+    return '';
+  }
+}
+
 // ── World locations cache ───────────────────────────────────────────────
 let _worldLocations = null;
 
+async function readWorldLocationsRecursive(dirPath, relParts) {
+  const results = [];
+  try {
+    const entries = await invoke('read_dir', { path: dirPath });
+    const sorted = entries.filter(e => e.is_dir && !e.name.startsWith('.')).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of sorted) {
+      const crumb = [...relParts, entry.name].join(' > ');
+      const notePath = `${entry.path}/${entry.name}.md`;
+      let noteExists = false;
+      try { await invoke('read_text_file', { path: notePath }); noteExists = true; } catch { /* no note */ }
+      results.push({
+        name: entry.name,
+        display_name: crumb,
+        folder_path: entry.path,
+        note_path: noteExists ? notePath : null,
+      });
+      const sub = await readWorldLocationsRecursive(entry.path, [...relParts, entry.name]);
+      results.push(...sub);
+    }
+  } catch { /* unreadable dir */ }
+  return results;
+}
+
 async function loadWorldLocations() {
   if (_worldLocations) return _worldLocations;
-  const res = await fetch(`${API}/locations/world`);
-  const { locations } = await res.json();
-  _worldLocations = locations;
-  return locations;
+  const locRoot = `${VAULT_PATH}/01 World/Locations`;
+  _worldLocations = await readWorldLocationsRecursive(locRoot, []);
+  return _worldLocations;
 }
 
 function promptShopLocation(npcNames) {
@@ -440,15 +483,34 @@ document.addEventListener('click', async (e) => {
     });
     const result = await res.json();
 
-    if (result.success) {
+    if (data.kind === 'npc' && result.markdown) {
+      const npcType = payload.npc_type || 'Minor';
+      const safeName = payload.name.replace(/[^\w\s'\-]/g, '').trim();
+      const npcPath = `${VAULT_PATH}/02 Characters/NPCs/${npcType}/${safeName}.md`;
+      await invoke('write_text_file', { path: npcPath, content: result.markdown });
       btn.innerHTML = checkCircleSvg;
       btn.classList.add('saved');
       btn.dataset.saved = '1';
-      btn.title = result.npc_paths?.length
-        ? `Saved to vault + ${result.npc_paths.length} NPC file(s) created`
-        : 'Saved to vault';
+      btn.title = 'Saved to vault';
+    } else if (data.kind === 'shop' && result.shop_markdown) {
+      const safeName = payload.name.replace(/[^\w\s'\-]/g, '').trim();
+      const shopsDir = payload.location_folder_path
+        ? `${payload.location_folder_path}/Shops`
+        : `${VAULT_PATH}/01 World/Shops`;
+      await invoke('write_text_file', { path: `${shopsDir}/${safeName}.md`, content: result.shop_markdown });
+      let npcCount = 0;
+      for (const [npcName, npcMd] of Object.entries(result.npc_markdowns || {})) {
+        const safeNpcName = npcName.replace(/[^\w\s'\-]/g, '').trim();
+        const npcPath = `${VAULT_PATH}/02 Characters/NPCs/Minor/${safeNpcName}.md`;
+        await invoke('write_text_file', { path: npcPath, content: npcMd });
+        npcCount++;
+      }
+      btn.innerHTML = checkCircleSvg;
+      btn.classList.add('saved');
+      btn.dataset.saved = '1';
+      btn.title = npcCount ? `Saved to vault + ${npcCount} NPC file(s) created` : 'Saved to vault';
     } else {
-      showToast(`Save failed: ${result.error}`);
+      showToast(`Save failed: unexpected server response`);
       btn.disabled = false;
     }
   } catch (err) {
@@ -458,6 +520,30 @@ document.addEventListener('click', async (e) => {
 });
 
 let _locationsCache = null;
+
+async function scanVaultLocations(dirPath) {
+  const results = [];
+  const EXCLUDE = ['ZZ_Workbench', '00 To Process'];
+  try {
+    const entries = await invoke('read_dir', { path: dirPath });
+    for (const entry of entries) {
+      if (!entry.is_dir || entry.name.startsWith('.') || EXCLUDE.includes(entry.name)) continue;
+      // Check for a same-name .md file or overview.md
+      for (const candidate of [`${entry.name}.md`, 'overview.md', 'Overview.md']) {
+        try {
+          const notePath = `${entry.path}/${candidate}`;
+          await invoke('read_text_file', { path: notePath });
+          results.push({ name: entry.name, path: notePath });
+          break;
+        } catch { /* not found */ }
+      }
+      // Recurse into subdirectory
+      const sub = await scanVaultLocations(entry.path);
+      results.push(...sub);
+    }
+  } catch { /* unreadable dir */ }
+  return results;
+}
 
 async function loadLocations(selectId, btnId) {
   const select = document.getElementById(selectId);
@@ -469,9 +555,7 @@ async function loadLocations(selectId, btnId) {
   select.innerHTML = '<option value="">Loading locations…</option>';
   btn.disabled = true;
   try {
-    const res  = await fetch(`${API}/locations`);
-    const data = await res.json();
-    _locationsCache = data.locations;
+    _locationsCache = await scanVaultLocations(VAULT_PATH);
     populateSelect(select, btn, _locationsCache);
   } catch {
     select.innerHTML = '<option value="">Failed to load locations</option>';
@@ -516,12 +600,20 @@ document.getElementById('npc-generate-btn').addEventListener('click', async () =
   cards.style.display = 'none';
   cards.innerHTML = '';
 
+  let population = '';
+  if (locationPath) {
+    try {
+      const content = await invoke('read_text_file', { path: locationPath });
+      population = extractSection(content, 'Population');
+    } catch { /* file unreadable — use empty population */ }
+  }
+
   let fullText = '';
   try {
     const res = await fetch(`${API}/generate/npcs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ location_name: locationName, location_path: locationPath, count }),
+      body: JSON.stringify({ location_name: locationName, population, count }),
     });
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
@@ -659,12 +751,19 @@ document.getElementById('shop-generate-btn').addEventListener('click', async () 
   cards.style.display = 'none';
   cards.innerHTML = '';
 
+  let location_content = '';
+  try {
+    const fileContent = await invoke('read_text_file', { path: locationPath });
+    location_content = extractLocationContent(fileContent);
+  } catch { /* file unreadable */ }
+  const pc_info = await getActivePcInfo();
+
   let fullText = '';
   try {
     const res = await fetch(`${API}/generate/shops`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ location_name: locationName, location_path: locationPath }),
+      body: JSON.stringify({ location_name: locationName, location_content, pc_info }),
     });
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
@@ -777,13 +876,6 @@ document.getElementById('error-modal-close').addEventListener('click', () => {
   document.getElementById('error-modal').style.display = 'none';
 });
 
-document.getElementById('settings-btn').addEventListener('click', () => {
-  document.getElementById('settings-modal').style.display = 'flex';
-});
-document.getElementById('settings-close').addEventListener('click', () => {
-  document.getElementById('settings-modal').style.display = 'none';
-});
-
 /** Shows the limit modal. Resolves true if user clicks Proceed, false if Cancel. */
 function confirmLimitModal(used) {
   return new Promise((resolve) => {
@@ -876,11 +968,10 @@ function updateStatus(data) {
       : 'Never indexed';
     indexError.style.display = 'none';
     _lastErrorText = null;
-    if (!isQuerying && !isIngesting) {
+    if (!isQuerying) {
       sendBtn.disabled    = false;
       queryInput.disabled = false;
     }
-    reindexBtn.disabled = false;
   } else if (data.loading) {
     overlay.style.display = 'flex';
     dot.className          = 'status-dot loading';
@@ -905,8 +996,6 @@ function updateStatus(data) {
     const detailsBtn = document.getElementById('index-error-details-btn');
     detailsBtn.style.display = 'inline';
     detailsBtn.onclick = () => showErrorModal(data.error);
-    // Re-enable controls so the user can retry re-indexing
-    reindexBtn.disabled = false;
     if (!isQuerying) {
       sendBtn.disabled    = false;
       queryInput.disabled = false;
@@ -915,14 +1004,6 @@ function updateStatus(data) {
     if (data.error !== _lastErrorText) {
       _lastErrorText = data.error;
       showToast(`Index error: ${data.error.length > 60 ? data.error.slice(0, 60) + '… (click Details)' : data.error}`);
-      // Also append to the ingest log if it's open
-      if (ingestLog.style.display !== 'none') {
-        const el = document.createElement('div');
-        el.className = 'ingest-log-entry error';
-        el.textContent = `Reload failed: ${data.error}`;
-        ingestEntries.appendChild(el);
-        ingestLog.scrollTop = ingestLog.scrollHeight;
-      }
     }
   }
 }
@@ -1077,7 +1158,7 @@ function showSources(sources) {
       <div class="source-card-text">${escapeHtml(s.text)}</div>
       <div class="source-score">Relevance: ${(s.score * 100).toFixed(0)}%</div>
     `;
-    const openTarget = s.obsidian_url || s.file_path;
+    const openTarget = s.obsidian_url || buildObsidianUrl(s.file_path);
     if (openTarget) {
       card.addEventListener('click', () => invoke('open_file', { path: openTarget }));
     }
@@ -1096,86 +1177,6 @@ sourcesToggleBtn.addEventListener('click', () => {
 });
 
 // ── Ingest ─────────────────────────────────────────────────────────────
-async function pollUntilLoaded() {
-  try {
-    const res = await fetch(`${API}/status`);
-    const data = await res.json();
-    updateStatus(data);
-    if (data.loaded) {
-      addLogEntry(`Index ready — ${data.doc_count.toLocaleString()} chunks loaded.`, 'done');
-    } else if (data.error) {
-      addLogEntry(`Reload failed: ${data.error}`, 'error');
-    } else {
-      setTimeout(pollUntilLoaded, 2000);
-    }
-  } catch {
-    setTimeout(pollUntilLoaded, 3000);
-  }
-}
-
-async function startIngest() {
-  if (isIngesting) return;
-  isIngesting = true;
-
-  reindexBtn.disabled  = true;
-  sendBtn.disabled     = true;
-  queryInput.disabled  = true;
-
-  ingestLog.style.display = 'block';
-  ingestEntries.innerHTML = '';
-
-  const addLogEntry = (text, type = '') => {
-    const el = document.createElement('div');
-    el.className = `ingest-log-entry ${type}`.trim();
-    const now = new Date();
-    const ts = now.toLocaleDateString([], { year: 'numeric', month: '2-digit', day: '2-digit' })
-      + ' ' + now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }).toLowerCase();
-    el.innerHTML = `<span class="log-ts">${ts}</span> ${escapeHtml(text)}`;
-    ingestEntries.appendChild(el);
-    ingestLog.scrollTop = ingestLog.scrollHeight;
-  };
-
-  try {
-    const rebuild = document.getElementById('rebuild-checkbox').checked;
-    const response = await fetch(`${API}/ingest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rebuild }),
-    });
-    const reader   = response.body.getReader();
-    const decoder  = new TextDecoder();
-    let buffer     = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const data = JSON.parse(line.slice(6));
-          if (data.progress) addLogEntry(data.progress, data.done ? '' : '');
-          if (data.error)    addLogEntry(`Error: ${data.error}`, 'error');
-          if (data.done)     pollUntilLoaded();
-        } catch {
-          // ignore malformed SSE line
-        }
-      }
-    }
-  } catch (e) {
-    addLogEntry(`Connection error: ${e.message}`, 'error');
-  } finally {
-    isIngesting          = false;
-    reindexBtn.disabled  = false;
-    sendBtn.disabled     = false;
-    queryInput.disabled  = false;
-  }
-}
-
 // ── Input handling ─────────────────────────────────────────────────────
 queryInput.addEventListener('input', () => {
   queryInput.style.height = 'auto';
@@ -1198,8 +1199,6 @@ sendBtn.addEventListener('click', () => {
   queryInput.style.height = 'auto';
   sendQuery(val);
 });
-
-reindexBtn.addEventListener('click', startIngest);
 
 attachChipListeners();
 

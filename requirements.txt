@@ -49,9 +49,14 @@ jsonschema-specifications==2025.9.1
 kubernetes==35.0.0
 llama-index-core==0.14.13
 llama-index-embeddings-ollama==0.8.6
+llama-index-embeddings-openai
 llama-index-instrumentation==0.4.2
 llama-index-llms-ollama==0.9.1
+llama-index-llms-openai
+llama-index-retrievers-bm25
+llama-index-vector-stores-chroma
 llama-index-workflows==2.13.1
+openai
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 marshmallow==3.26.2

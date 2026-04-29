@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
-from urllib.parse import quote
-from config import OBSIDIAN_VAULT
 import tiktoken
 import uvicorn
 from fastapi import FastAPI
@@ -29,7 +27,27 @@ from pydantic import BaseModel
 
 _TRACKER_URL = "https://token-tracker-roan.vercel.app/api/tokens"
 _DAILY_LIMIT = 250_000
-_enc = tiktoken.encoding_for_model("gpt-4o-mini")
+_enc = tiktoken.encoding_for_model("gpt-4o-mini")  # pre-flight estimates only
+
+# Per-request token counter (reset before each LLM call, read after)
+_token_counter = None
+_token_counter_lock = threading.Lock()
+
+
+def _reset_token_counter() -> None:
+    if _token_counter is not None:
+        with _token_counter_lock:
+            _token_counter.reset_counts()
+
+
+def _read_token_count() -> int:
+    if _token_counter is None:
+        return 0
+    with _token_counter_lock:
+        return (
+            _token_counter.total_llm_token_count
+            + _token_counter.total_embedding_token_count
+        )
 
 
 def _get_tokens_used() -> int:
@@ -122,6 +140,7 @@ def _load_index() -> None:
             USE_OPENAI_EMBEDDINGS,
         )
         from llama_index.core import Settings, VectorStoreIndex
+        from llama_index.core.callbacks import CallbackManager, TokenCountingHandler
         from llama_index.core.prompts import PromptTemplate
         from llama_index.core.query_engine import RetrieverQueryEngine
         from llama_index.core.retrievers import QueryFusionRetriever
@@ -131,6 +150,11 @@ def _load_index() -> None:
         import chromadb
 
         _step("Configuring OpenAI LLM...")
+        global _token_counter
+        _token_counter = TokenCountingHandler(
+            tokenizer=tiktoken.encoding_for_model("gpt-4o-mini").encode
+        )
+        Settings.callback_manager = CallbackManager([_token_counter])
         Settings.llm = OpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
 
         if USE_OPENAI_EMBEDDINGS:
@@ -142,6 +166,15 @@ def _load_index() -> None:
 
         _step("Opening ChromaDB...")
         chroma_client = chromadb.PersistentClient(path=str(CHROMA_DB_PATH))
+        existing = [c.name for c in chroma_client.list_collections()]
+        if "dnd_campaign" not in existing:
+            _state["loading"] = False
+            _state["loaded"] = False
+            _state["loading_step"] = None
+            _state["loading_started_at"] = None
+            _state["error"] = "Not yet indexed. Run sync_to_server.sh on the Mac to build the index."
+            print(f"[server] {_state['error']}", file=sys.stderr)
+            return
         chroma_collection = chroma_client.get_collection("dnd_campaign")
 
         nodes_path = Path(CHROMA_DB_PATH) / "bm25_nodes.pkl"
@@ -264,7 +297,7 @@ async def get_status():
 
 @app.get("/tokens")
 async def get_tokens():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     used = await loop.run_in_executor(None, _get_tokens_used)
     return {"used": used, "limit": _DAILY_LIMIT}
 
@@ -272,35 +305,6 @@ async def get_tokens():
 # ---------------------------------------------------------------------------
 # Tool helpers
 # ---------------------------------------------------------------------------
-
-_EXCLUDE_DIRS = {"ZZ_Workbench", "00 To Process"}
-
-
-def _extract_section(content: str, section_name: str) -> str:
-    """Return the text body of the first markdown heading matching section_name."""
-    pattern = r'(?m)^#{1,4}\s+' + re.escape(section_name) + r'\s*\n(.*?)(?=\n#{1,4}\s|\Z)'
-    m = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
-    return m.group(1).strip() if m else ""
-
-
-def _get_active_pc_info() -> str:
-    """Read active PC files and return name + goals for shop weighting."""
-    pc_dir = OBSIDIAN_VAULT / "02 Characters" / "PCs"
-    if not pc_dir.exists():
-        return ""
-    summaries = []
-    for pc_file in sorted(pc_dir.glob("*.md")):
-        try:
-            content = pc_file.read_text(errors="replace")
-            if "#inactive" in content or "#deceased" in content:
-                continue
-            name = pc_file.stem
-            goal = _extract_section(content, "Primary Goal") or _extract_section(content, "Goals")
-            summaries.append(f"{name}: {goal[:200]}" if goal else f"{name}")
-        except Exception:
-            continue
-    return "\n".join(summaries)
-
 
 def _build_shop_prompt(location_name: str, location_notes: str, pc_info: str) -> str:
     pc_section = (
@@ -380,40 +384,9 @@ def _build_npc_prompt(location_name: str, population: str, count: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/locations")
-async def locations_endpoint():
-    """Return location folders that have an overview or same-name md file."""
-    locations = []
-    seen: set = set()
-    try:
-        for md_file in sorted(OBSIDIAN_VAULT.rglob("*.md")):
-            rel = md_file.relative_to(OBSIDIAN_VAULT)
-            if any(str(rel).startswith(ex) for ex in _EXCLUDE_DIRS):
-                continue
-            if md_file.name.startswith("."):
-                continue
-            folder = md_file.parent
-            if folder in seen or folder == OBSIDIAN_VAULT:
-                continue
-            folder_name = folder.name
-            # Prefer [folder_name].md, then overview.md (case-insensitive match)
-            preferred: Path | None = None
-            for candidate_name in [f"{folder_name}.md", "overview.md", "Overview.md"]:
-                candidate = folder / candidate_name
-                if candidate.exists():
-                    preferred = candidate
-                    break
-            if preferred:
-                seen.add(folder)
-                locations.append({"name": folder_name, "path": str(preferred)})
-    except Exception as exc:
-        print(f"[server] /locations error: {exc}", file=sys.stderr)
-    return {"locations": locations}
-
-
 class NpcRequest(BaseModel):
     location_name: str
-    location_path: str
+    population: str = ""
     count: int = 10
 
 
@@ -430,15 +403,10 @@ async def generate_npcs_endpoint(req: NpcRequest):
             from llama_index.core import Settings
             import queue as _queue
 
-            population = ""
-            if req.location_path:
-                file_path = Path(req.location_path)
-                if file_path.exists():
-                    content = file_path.read_text(errors="replace")
-                    population = _extract_section(content, "Population")
-
-            prompt = _build_npc_prompt(req.location_name, population, req.count)
+            prompt = _build_npc_prompt(req.location_name, req.population, req.count)
+            full_text = ""
             q: _queue.Queue = _queue.Queue()
+            _reset_token_counter()
 
             def stream_thread() -> None:
                 try:
@@ -451,13 +419,15 @@ async def generate_npcs_endpoint(req: NpcRequest):
 
             threading.Thread(target=stream_thread, daemon=True).start()
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             while True:
                 kind, value = await loop.run_in_executor(None, q.get)
                 if kind == "token":
+                    full_text += value
                     yield f"data: {json.dumps({'token': value})}\n\n"
                 elif kind == "done":
                     yield 'data: {"done": true}\n\n'
+                    loop.run_in_executor(None, _report_tokens, _read_token_count())
                     break
                 else:
                     yield f"data: {json.dumps({'error': value})}\n\n"
@@ -466,12 +436,13 @@ async def generate_npcs_endpoint(req: NpcRequest):
         except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 class ShopRequest(BaseModel):
     location_name: str
-    location_path: str
+    location_content: str = ""
+    pc_info: str = ""
 
 
 @app.post("/generate/shops")
@@ -487,20 +458,10 @@ async def generate_shops_endpoint(req: ShopRequest):
             from llama_index.core import Settings
             import queue as _queue
 
-            file_path = Path(req.location_path)
-            location_notes = ""
-            if file_path.exists():
-                content = file_path.read_text(errors="replace")
-                # Use description / overview section if present, else first 800 chars
-                location_notes = (
-                    _extract_section(content, "Description")
-                    or _extract_section(content, "Overview")
-                    or content[:800]
-                )
-
-            pc_info = _get_active_pc_info()
-            prompt = _build_shop_prompt(req.location_name, location_notes, pc_info)
+            prompt = _build_shop_prompt(req.location_name, req.location_content, req.pc_info)
+            full_text = ""
             q: _queue.Queue = _queue.Queue()
+            _reset_token_counter()
 
             def stream_thread() -> None:
                 try:
@@ -513,13 +474,15 @@ async def generate_shops_endpoint(req: ShopRequest):
 
             threading.Thread(target=stream_thread, daemon=True).start()
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             while True:
                 kind, value = await loop.run_in_executor(None, q.get)
                 if kind == "token":
+                    full_text += value
                     yield f"data: {json.dumps({'token': value})}\n\n"
                 elif kind == "done":
                     yield 'data: {"done": true}\n\n'
+                    loop.run_in_executor(None, _report_tokens, _read_token_count())
                     break
                 else:
                     yield f"data: {json.dumps({'error': value})}\n\n"
@@ -528,7 +491,7 @@ async def generate_shops_endpoint(req: ShopRequest):
         except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/suggest")
@@ -552,7 +515,7 @@ async def suggest_endpoint():
         f"Campaign notes:\n{context}\n\nJSON array:"
     )
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         response = await loop.run_in_executor(None, lambda: Settings.llm.complete(prompt))
         text = response.text.strip()
@@ -585,8 +548,9 @@ async def query_endpoint(req: QueryRequest):
             return
 
         try:
+            import queue as _queue
             # ── Pre-flight: check daily token limit ──────────────────────
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             used = await loop.run_in_executor(None, _get_tokens_used)
             if used >= _DAILY_LIMIT:
                 payload = json.dumps({
@@ -598,49 +562,50 @@ async def query_endpoint(req: QueryRequest):
                 return
 
             query_engine = _state["query_engine"]
+            q: _queue.Queue = _queue.Queue()
+            _reset_token_counter()
 
-            # Run the (blocking) query in a thread pool so we don't block the event loop
-            response = await loop.run_in_executor(
-                None, lambda: query_engine.query(question)
-            )
+            def query_thread() -> None:
+                try:
+                    response = query_engine.query(question)
+                    for token in response.response_gen:
+                        q.put(("token", token, None))
+                    q.put(("done", None, response))
+                except Exception as e:
+                    q.put(("error", str(e), None))
 
-            # Stream tokens, accumulating for token counting
+            threading.Thread(target=query_thread, daemon=True).start()
+
             full_response = ""
-            for token in response.response_gen:
-                full_response += token
-                payload = json.dumps({"token": token})
-                yield f"data: {payload}\n\n"
+            final_response = None
+            while True:
+                kind, value, extra = await loop.run_in_executor(None, q.get)
+                if kind == "token":
+                    full_response += value
+                    payload = json.dumps({"token": value})
+                    yield f"data: {payload}\n\n"
+                elif kind == "done":
+                    final_response = extra
+                    break
+                else:
+                    payload = json.dumps({"error": value})
+                    yield f"data: {payload}\n\n"
+                    return
 
-            # ── Count tokens (tiktoken approximation) ────────────────────
-            output_tokens = len(_enc.encode(full_response))
-            context_text = " ".join(
-                n.node.get_content()
-                for n in (response.source_nodes or [])
-            )
-            input_tokens = (
-                len(_enc.encode(context_text))
-                + len(_enc.encode(question))
-                + 200  # prompt template overhead
-            )
-            total_tokens = input_tokens + output_tokens
+            # Report actual API usage via TokenCountingHandler
+            total_tokens = _read_token_count()
 
             # Report in background (non-blocking)
             loop.run_in_executor(None, _report_tokens, total_tokens)
 
             # Build sources list
             sources = []
-            if hasattr(response, "source_nodes") and response.source_nodes:
-                for node in response.source_nodes:
+            if final_response and hasattr(final_response, "source_nodes") and final_response.source_nodes:
+                for node in final_response.source_nodes:
                     meta = node.node.metadata or {}
                     file_path = meta.get("file_path", "")
                     file_name = Path(file_path).name if file_path else meta.get("file_name", "Unknown")
                     obsidian_url = None
-                    try:
-                        rel = Path(file_path).relative_to(OBSIDIAN_VAULT)
-                        note = str(rel.with_suffix(""))
-                        obsidian_url = f"obsidian://open?vault={quote(OBSIDIAN_VAULT.name)}&file={quote(note)}"
-                    except (ValueError, Exception):
-                        pass
                     sources.append(
                         {
                             "file": file_name,
@@ -664,79 +629,18 @@ async def query_endpoint(req: QueryRequest):
             payload = json.dumps({"error": str(exc)})
             yield f"data: {payload}\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-class IngestRequest(BaseModel):
-    rebuild: bool = False
-
-
-@app.post("/ingest")
-async def ingest_endpoint(req: IngestRequest = IngestRequest()):
-    """SSE streaming endpoint: runs ingest.py as a subprocess and streams its stdout."""
-
-    async def generate() -> AsyncGenerator[str, None]:
-        # Locate the project root (same directory as this file)
-        project_root = Path(__file__).parent.resolve()
-        ingest_script = project_root / "ingest.py"
-
-        # Prefer the venv python
-        venv_python = project_root / "venv" / "bin" / "python3"
-        python_exe = str(venv_python) if venv_python.exists() else sys.executable
-
-        try:
-            cmd = [python_exe, str(ingest_script)]
-            if req.rebuild:
-                cmd.append("--rebuild")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(project_root),
-            )
-
-            # Stream stdout line by line
-            assert proc.stdout is not None
-            async for raw_line in proc.stdout:
-                line = raw_line.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    payload = json.dumps({"progress": line})
-                    yield f"data: {payload}\n\n"
-
-            await proc.wait()
-
-            if proc.returncode == 0:
-                _write_last_ingest()
-                _state["last_ingest"] = _read_last_ingest()
-
-                payload = json.dumps(
-                    {"progress": "Indexing complete. Reloading index...", "done": False}
-                )
-                yield f"data: {payload}\n\n"
-
-                # Reload the index in background
-                _state["loaded"] = False
-                _state["loading"] = True
-                threading.Thread(target=_load_index, daemon=True).start()
-
-                payload = json.dumps(
-                    {"progress": "Index reload started.", "done": True}
-                )
-                yield f"data: {payload}\n\n"
-            else:
-                payload = json.dumps(
-                    {
-                        "error": f"ingest.py exited with code {proc.returncode}",
-                        "done": True,
-                    }
-                )
-                yield f"data: {payload}\n\n"
-
-        except Exception as exc:
-            payload = json.dumps({"error": str(exc), "done": True})
-            yield f"data: {payload}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+@app.post("/reload")
+async def reload_endpoint():
+    """Trigger a background reload of the ChromaDB index."""
+    if _state["loading"]:
+        return {"status": "already_loading", "step": _state["loading_step"]}
+    _state["loaded"] = False
+    _state["loading"] = True
+    threading.Thread(target=_load_index, daemon=True).start()
+    return {"status": "reload_started"}
 
 
 # ---------------------------------------------------------------------------
@@ -762,12 +666,8 @@ async def save_npc_endpoint(req: SaveNpcRequest):
     from datetime import date
     today = date.today().isoformat()
     npc_type = req.npc_type if req.npc_type in _NPC_TYPES else "Minor"
-    safe_name = re.sub(r'[^\w\s\'\-]', '', req.name).strip()
-    save_dir = OBSIDIAN_VAULT / "02 Characters" / "NPCs" / npc_type
-    save_dir.mkdir(parents=True, exist_ok=True)
-    file_path = save_dir / f"{safe_name}.md"
     loc_line = f"\nLocation: [[{req.location_name}]]" if req.location_name else ""
-    content = (
+    markdown = (
         f"# {req.name}\n\n"
         f"Category: Characters / NPCs / {npc_type}{loc_line}\n\n"
         f"#npc #{npc_type.lower()} #generated #date/{today}\n\n"
@@ -776,11 +676,7 @@ async def save_npc_endpoint(req: SaveNpcRequest):
         f"## Appearance\n{req.appearance}\n\n"
         f"## Characteristics\n{req.characteristics}\n"
     )
-    try:
-        file_path.write_text(content)
-        return {"success": True, "path": str(file_path)}
-    except Exception as exc:
-        return {"success": False, "error": str(exc)}
+    return {"markdown": markdown}
 
 
 def _parse_proprietor_names(text: str) -> list:
@@ -788,36 +684,6 @@ def _parse_proprietor_names(text: str) -> list:
     names_part = re.split(r'\s*[—–-]{1,2}\s*', text, maxsplit=1)[0].strip()
     names = re.split(r'\s+and\s+', names_part, flags=re.IGNORECASE)
     return [n.strip() for n in names if n.strip()]
-
-
-def _collect_world_locations(root: Path, current: Path, results: list, rel_parts: list) -> None:
-    try:
-        entries = sorted(current.iterdir(), key=lambda p: p.name)
-    except PermissionError:
-        return
-    for entry in entries:
-        if entry.name.startswith('.'):
-            continue
-        if entry.is_dir():
-            crumb = " > ".join(rel_parts + [entry.name])
-            main_note = entry / f"{entry.name}.md"
-            results.append({
-                "name": entry.name,
-                "display_name": crumb,
-                "folder_path": str(entry),
-                "note_path": str(main_note) if main_note.exists() else None,
-            })
-            _collect_world_locations(root, entry, results, rel_parts + [entry.name])
-
-
-@app.get("/locations/world")
-async def world_locations_endpoint():
-    """Return all location folders under 01 World/Locations with breadcrumb display names."""
-    locations_root = OBSIDIAN_VAULT / "01 World" / "Locations"
-    results: list = []
-    if locations_root.exists():
-        _collect_world_locations(locations_root, locations_root, results, [])
-    return {"locations": results}
 
 
 class NpcData(BaseModel):
@@ -845,20 +711,12 @@ async def save_shop_endpoint(req: SaveShopRequest):
     today = date.today().isoformat()
     safe_name = re.sub(r'[^\w\s\'\-]', '', req.name).strip()
 
-    # Shop file lives inside the chosen location folder's Shops/ subfolder
-    if req.location_folder_path:
-        shops_dir = Path(req.location_folder_path) / "Shops"
-    else:
-        shops_dir = OBSIDIAN_VAULT / "01 World" / "Shops"
-    shops_dir.mkdir(parents=True, exist_ok=True)
-    file_path = shops_dir / f"{safe_name}.md"
-
     # Build proprietor wiki-links from NPC data
     prop_links = ", ".join(f"[[{npc.name}]]" for npc in req.npcs) if req.npcs else ""
 
     loc_line  = f"\nLocation: [[{req.location_name}]]" if req.location_name else ""
     type_line = f"\n- Type: {req.shop_type}" if req.shop_type else ""
-    content = (
+    shop_markdown = (
         f"# {req.name}\n\n"
         f"Category: Shops{loc_line}\n\n"
         f"#shop #generated #date/{today}{type_line}\n\n"
@@ -866,40 +724,27 @@ async def save_shop_endpoint(req: SaveShopRequest):
         f"## Description\n{req.description}\n\n"
         f"## Inventory\n{req.inventory}\n"
     )
-    try:
-        file_path.write_text(content)
-    except Exception as exc:
-        return {"success": False, "error": str(exc)}
 
-    # Create Minor NPC files for each proprietor (skip if file already exists)
-    npc_dir = OBSIDIAN_VAULT / "02 Characters" / "NPCs" / "Minor"
-    npc_dir.mkdir(parents=True, exist_ok=True)
-    npc_paths = []
+    # Build NPC markdown for each proprietor
+    npc_markdowns: dict[str, str] = {}
     for npc in req.npcs:
-        safe_prop = re.sub(r'[^\w\s\'\-]', '', npc.name).strip()
-        npc_path = npc_dir / f"{safe_prop}.md"
-        if not npc_path.exists():
-            loc_npc_line = f"\nLocation: [[{req.location_name}]]" if req.location_name else ""
-            pron_line = f"- Pronunciation: {npc.pronunciation}\n" if npc.pronunciation else ""
-            appearance_section = f"## Appearance\n{npc.appearance}\n\n" if npc.appearance else ""
-            characteristics_section = f"## Characteristics\n{npc.characteristics}\n\n" if npc.characteristics else ""
-            npc_content = (
-                f"# {npc.name}\n\n"
-                f"Category: Characters / NPCs / Minor{loc_npc_line}\n\n"
-                f"#npc #minor #proprietor #generated #date/{today}\n\n"
-                f"- Race: {npc.race} | Gender: {npc.gender}\n"
-                f"{pron_line}"
-                f"- Proprietor of: [[{req.name}]]\n\n"
-                f"{appearance_section}"
-                f"{characteristics_section}"
-            )
-            try:
-                npc_path.write_text(npc_content)
-                npc_paths.append(str(npc_path))
-            except Exception:
-                pass
+        loc_npc_line = f"\nLocation: [[{req.location_name}]]" if req.location_name else ""
+        pron_line = f"- Pronunciation: {npc.pronunciation}\n" if npc.pronunciation else ""
+        appearance_section = f"## Appearance\n{npc.appearance}\n\n" if npc.appearance else ""
+        characteristics_section = f"## Characteristics\n{npc.characteristics}\n\n" if npc.characteristics else ""
+        npc_markdown = (
+            f"# {npc.name}\n\n"
+            f"Category: Characters / NPCs / Minor{loc_npc_line}\n\n"
+            f"#npc #minor #proprietor #generated #date/{today}\n\n"
+            f"- Race: {npc.race} | Gender: {npc.gender}\n"
+            f"{pron_line}"
+            f"- Proprietor of: [[{req.name}]]\n\n"
+            f"{appearance_section}"
+            f"{characteristics_section}"
+        )
+        npc_markdowns[npc.name] = npc_markdown
 
-    return {"success": True, "path": str(file_path), "npc_paths": npc_paths}
+    return {"shop_markdown": shop_markdown, "npc_markdowns": npc_markdowns}
 
 
 # ---------------------------------------------------------------------------
@@ -907,4 +752,4 @@ async def save_shop_endpoint(req: SaveShopRequest):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
