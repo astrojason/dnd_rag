@@ -118,6 +118,7 @@ print("Loading documents...")
 EXCLUDE_DIRS = [
     "ZZ_Workbench",
     "00 To Process/LLM Chats",
+    "03 Story/Sessions/DM Reviews",
 ]
 exclude_patterns = [str(OBSIDIAN_VAULT / d) + "/*" for d in EXCLUDE_DIRS]
 
