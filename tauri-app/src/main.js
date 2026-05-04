@@ -42,8 +42,14 @@ document.getElementById('app').innerHTML = `
   </header>
 
   <div class="main-layout">
-    <main class="chat-area">
-      <div class="content-overlay" id="content-overlay">
+    <div class="content-area">
+      <nav class="tab-bar">
+        <button class="tab-btn active" data-tab="oracle">⚔ Oracle</button>
+        <button class="tab-btn" data-tab="threads">⚡ Threads</button>
+        <button class="tab-btn" data-tab="session">📜 Session</button>
+      </nav>
+      <main class="chat-area tab-panel" id="panel-oracle">
+        <div class="content-overlay" id="content-overlay">
         <div class="overlay-content">
           <div class="overlay-spinner"></div>
           <div class="overlay-text" id="overlay-text">Connecting to server...</div>
@@ -125,6 +131,27 @@ document.getElementById('app').innerHTML = `
       </div>
     </main>
 
+    <div class="tab-panel" id="panel-threads" style="display:none">
+      <div class="threads-toolbar">
+        <button class="btn btn-primary" id="threads-scan-btn">✦ Scan from Recap</button>
+        <button class="btn btn-ghost" id="threads-refresh-btn">↻ Refresh</button>
+      </div>
+      <div id="threads-empty" class="threads-empty" style="display:none">
+        No plot threads yet. Click <strong>Scan from Recap</strong> to extract threads from your latest session recap.
+      </div>
+      <div id="thread-matrix-wrap" class="thread-matrix-wrap" style="display:none"></div>
+    </div>
+
+    <div class="tab-panel" id="panel-session" style="display:none">
+      <div class="panel-placeholder">
+        <div class="placeholder-icon">📜</div>
+        <div class="placeholder-title">Session Planner</div>
+        <div class="placeholder-body">Coming in Phase 2 — auto-discovers latest session recaps and generates next steps.</div>
+      </div>
+    </div>
+
+    </div>
+
     <aside class="sidebar">
       <div class="sidebar-top">
         <div class="sidebar-section-title">Oracle Index</div>
@@ -160,6 +187,22 @@ document.getElementById('app').innerHTML = `
         </button>
       </div>
     </aside>
+  </div>
+
+  <div class="modal-overlay" id="threads-approval-modal" style="display:none">
+    <div class="modal modal-tool">
+      <div class="tool-modal-header">
+        <div class="tool-modal-title-row">
+          <span class="modal-title" style="margin-bottom:0">Scan for Plot Threads</span>
+        </div>
+        <button class="modal-x-btn" id="threads-modal-close"></button>
+      </div>
+      <div class="threads-modal-body" id="threads-modal-body"></div>
+      <div class="modal-actions" style="padding:16px 24px;border-top:1px solid var(--border-subtle)">
+        <button class="btn btn-ghost" id="threads-modal-cancel">Cancel</button>
+        <button class="btn btn-primary" id="threads-modal-confirm" disabled>Add Selected</button>
+      </div>
+    </div>
   </div>
 
   <div class="modal-overlay" id="npc-modal" style="display:none">
@@ -296,6 +339,7 @@ sourcesNext.addEventListener('click', () => scrollSources(1));
 document.getElementById('tool-npc-icon').innerHTML  = userGroupSvg;
 document.getElementById('tool-shop-icon').innerHTML = storefrontSvg;
 document.getElementById('npc-modal-icon').innerHTML  = userGroupSvg;
+document.getElementById('threads-modal-close').innerHTML = xMarkSvg;
 document.getElementById('npc-modal-close').innerHTML = xMarkSvg;
 document.getElementById('npc-generate-icon').innerHTML = sparklesSvg;
 document.getElementById('shop-modal-icon').innerHTML  = storefrontSvg;
@@ -1216,3 +1260,297 @@ async function initTokens() {
   }
 }
 initTokens();
+
+// ── Tab navigation ─────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+    document.querySelectorAll('.tab-panel').forEach(p => { p.style.display = 'none'; });
+    document.getElementById(`panel-${tab}`).style.display = '';
+    if (tab === 'threads') loadThreadsTab();
+  });
+});
+
+// ── Active PC names ────────────────────────────────────────────────────
+async function getActivePcNames() {
+  const pcDir = `${VAULT_PATH}/02 Characters/PCs`;
+  try {
+    const entries = await invoke('read_dir', { path: pcDir });
+    const names = [];
+    for (const entry of entries) {
+      if (entry.is_dir || !entry.name.endsWith('.md')) continue;
+      try {
+        const content = await invoke('read_text_file', { path: entry.path });
+        if (content.includes('#inactive') || content.includes('#deceased')) continue;
+        names.push(entry.name.replace('.md', ''));
+      } catch { /* skip */ }
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+
+// ── Latest recap finder ────────────────────────────────────────────────
+async function findLatestRecap(subfolder) {
+  const base = `${VAULT_PATH}/03 Story/Sessions/${subfolder}`;
+  try {
+    const yearEntries = await invoke('read_dir', { path: base });
+    const yearDirs = yearEntries
+      .filter(e => e.is_dir && /^\d{4}$/.test(e.name))
+      .sort((a, b) => b.name.localeCompare(a.name));
+    for (const yearDir of yearDirs) {
+      try {
+        const files = await invoke('read_dir', { path: yearDir.path });
+        const mdFiles = files
+          .filter(e => !e.is_dir && e.name.endsWith('.md'))
+          .sort((a, b) => b.name.localeCompare(a.name));
+        if (mdFiles.length > 0) {
+          const content = await invoke('read_text_file', { path: mdFiles[0].path });
+          return { path: mdFiles[0].path, name: mdFiles[0].name, content };
+        }
+      } catch { /* skip year */ }
+    }
+  } catch { /* dir not found */ }
+  return null;
+}
+
+// ── Thread state ────────────────────────────────────────────────────────
+let _threads = [];
+let _pcNames = [];
+let _pcNamesLoaded = false;
+
+// ── Threads tab ─────────────────────────────────────────────────────────
+async function loadThreadsTab() {
+  try {
+    const res = await fetch(`${API}/threads`);
+    const data = await res.json();
+    _threads = data.threads || [];
+    if (!_pcNamesLoaded) {
+      _pcNames = await getActivePcNames();
+      _pcNamesLoaded = true;
+    }
+    renderThreadsPanel();
+  } catch (e) {
+    showToast(`Failed to load threads: ${e.message}`);
+  }
+}
+
+function renderThreadsPanel() {
+  const wrap  = document.getElementById('thread-matrix-wrap');
+  const empty = document.getElementById('threads-empty');
+  if (_threads.length === 0) {
+    wrap.style.display  = 'none';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  wrap.style.display  = 'block';
+  wrap.innerHTML = buildMatrixHtml(_threads, _pcNames);
+
+  // Row click → toggle detail row
+  wrap.querySelectorAll('.thread-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const idx    = row.dataset.index;
+      const detail = document.getElementById(`thread-detail-${idx}`);
+      const isOpen = detail.style.display !== 'none';
+      wrap.querySelectorAll('.thread-detail-row').forEach(d => { d.style.display = 'none'; });
+      wrap.querySelectorAll('.thread-row').forEach(r => r.classList.remove('expanded'));
+      if (!isOpen) {
+        detail.style.display = '';
+        row.classList.add('expanded');
+      }
+    });
+  });
+
+  // Status buttons inside detail rows
+  wrap.querySelectorAll('.status-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await setThreadStatus(btn.dataset.id, btn.dataset.status);
+    });
+  });
+}
+
+function buildMatrixHtml(threads, pcNames) {
+  const pcHeaders = pcNames.map(n => `<th class="matrix-pc-col">${escapeHtml(n)}</th>`).join('');
+  const colSpan = pcNames.length + 2;
+
+  const rows = threads.map((t, i) => {
+    const status = t.status || 'active';
+    const pcCells = pcNames.map(name => {
+      const rel = (t.pcs || []).find(p => p.name === name)?.role;
+      if (rel === 'involved') return `<td class="matrix-cell matrix-cell-involved" title="Involved">⚔</td>`;
+      if (rel === 'stake')    return `<td class="matrix-cell matrix-cell-stake" title="Personal stake">♦</td>`;
+      return `<td class="matrix-cell"></td>`;
+    }).join('');
+
+    return `
+      <tr class="thread-row" data-index="${i}" data-id="${escapeHtml(t.id || '')}">
+        <td class="matrix-thread-name">${escapeHtml(t.title || 'Untitled')}</td>
+        ${pcCells}
+        <td class="matrix-cell"><span class="badge badge-${escapeHtml(status)}">${escapeHtml(status)}</span></td>
+      </tr>
+      <tr class="thread-detail-row" id="thread-detail-${i}" style="display:none">
+        <td colspan="${colSpan}" class="thread-detail-cell">
+          <div class="thread-detail-inner">
+            <p class="thread-description">${escapeHtml(t.description || '')}</p>
+            <div class="thread-status-bar">
+              <span class="thread-status-label">Status</span>
+              <button class="status-btn${status === 'active'   ? ' current' : ''}" data-id="${escapeHtml(t.id || '')}" data-status="active">Active</button>
+              <button class="status-btn${status === 'dormant'  ? ' current' : ''}" data-id="${escapeHtml(t.id || '')}" data-status="dormant">Dormant</button>
+              <button class="status-btn${status === 'resolved' ? ' current' : ''}" data-id="${escapeHtml(t.id || '')}" data-status="resolved">Resolved</button>
+            </div>
+          </div>
+        </td>
+      </tr>`;
+  }).join('');
+
+  return `
+    <table class="thread-matrix">
+      <thead>
+        <tr>
+          <th class="matrix-thread-col">Thread</th>
+          ${pcHeaders}
+          <th class="matrix-status-col">Status</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function setThreadStatus(id, status) {
+  try {
+    const res = await fetch(`${API}/threads/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, status }),
+    });
+    const data = await res.json();
+    if (data.markdown) {
+      const threadsPath = `${VAULT_PATH}/03 Story/Plot Threads.md`;
+      await invoke('write_text_file', { path: threadsPath, content: data.markdown });
+      const t = _threads.find(th => th.id === id);
+      if (t) t.status = status;
+      renderThreadsPanel();
+      showToast('Status updated', 'success');
+    } else {
+      showToast(`Failed to update status: ${data.detail || 'Unknown error'}`);
+    }
+  } catch (e) {
+    showToast(`Failed to update status: ${e.message}`);
+  }
+}
+
+// ── Threads toolbar buttons ─────────────────────────────────────────────
+document.getElementById('threads-refresh-btn').addEventListener('click', () => loadThreadsTab());
+document.getElementById('threads-scan-btn').addEventListener('click', () => openThreadsScanModal());
+
+// ── Approval modal ──────────────────────────────────────────────────────
+async function openThreadsScanModal() {
+  const modal      = document.getElementById('threads-approval-modal');
+  const body       = document.getElementById('threads-modal-body');
+  const confirmBtn = document.getElementById('threads-modal-confirm');
+
+  modal.style.display  = 'flex';
+  confirmBtn.disabled  = true;
+  modal._proposed      = [];
+  body.innerHTML = `<div class="threads-modal-loading"><div class="overlay-spinner"></div><div>Loading recaps\u2026</div></div>`;
+
+  try {
+    const [playerRecap, dmRecap] = await Promise.all([
+      findLatestRecap('Player Recaps'),
+      findLatestRecap('DM Element Tables'),
+    ]);
+
+    if (!playerRecap) {
+      body.innerHTML = `<div class="threads-modal-error">No player recap found in <code>03 Story/Sessions/Player Recaps</code>.</div>`;
+      return;
+    }
+
+    body.innerHTML = `<div class="threads-modal-loading"><div class="overlay-spinner"></div><div>Extracting threads\u2026</div></div>`;
+
+    const res = await fetch(`${API}/threads/extract`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        player_recap: playerRecap.content,
+        dm_recap: dmRecap?.content || '',
+      }),
+    });
+    const data = await res.json();
+    const proposed = data.proposed || [];
+
+    if (proposed.length === 0) {
+      body.innerHTML = `<div class="threads-modal-error">No clear plot threads found in the latest recap.</div>`;
+      return;
+    }
+
+    body.innerHTML = `
+      <div class="threads-modal-source">
+        Recap: <strong>${escapeHtml(playerRecap.name)}</strong>
+        ${dmRecap ? `&middot; DM notes: <strong>${escapeHtml(dmRecap.name)}</strong>` : ''}
+      </div>
+      <div class="proposed-threads">
+        ${proposed.map((t, i) => `
+          <label class="proposed-thread-item">
+            <input type="checkbox" class="proposed-check" data-index="${i}" checked>
+            <div class="proposed-thread-body">
+              <div class="proposed-thread-title">${escapeHtml(t.title || 'Untitled')}</div>
+              <div class="proposed-thread-desc">${escapeHtml(t.description || '')}</div>
+              ${(t.pcs || []).length ? `<div class="proposed-thread-pcs">${t.pcs.map(p => `<span class="proposed-pc">${escapeHtml(p.name)} (${escapeHtml(p.role)})</span>`).join('')}</div>` : ''}
+            </div>
+          </label>`).join('')}
+      </div>`;
+
+    modal._proposed     = proposed;
+    confirmBtn.disabled = false;
+  } catch (e) {
+    body.innerHTML = `<div class="threads-modal-error">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+document.getElementById('threads-modal-close').addEventListener('click', () => {
+  document.getElementById('threads-approval-modal').style.display = 'none';
+});
+document.getElementById('threads-modal-cancel').addEventListener('click', () => {
+  document.getElementById('threads-approval-modal').style.display = 'none';
+});
+
+document.getElementById('threads-modal-confirm').addEventListener('click', async () => {
+  const modal    = document.getElementById('threads-approval-modal');
+  const proposed = modal._proposed || [];
+
+  const checked = [...document.querySelectorAll('.proposed-check:checked')]
+    .map(cb => proposed[parseInt(cb.dataset.index)])
+    .filter(Boolean);
+
+  if (checked.length === 0) { showToast('No threads selected.'); return; }
+
+  // Skip duplicates by title (case-insensitive)
+  const existingTitles = new Set(_threads.map(t => t.title?.toLowerCase()));
+  const newThreads     = checked.filter(t => !existingTitles.has(t.title?.toLowerCase()));
+  const merged         = [..._threads, ...newThreads];
+
+  try {
+    const res = await fetch(`${API}/threads/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threads: merged }),
+    });
+    const data = await res.json();
+    if (data.markdown) {
+      const threadsPath = `${VAULT_PATH}/03 Story/Plot Threads.md`;
+      await invoke('write_text_file', { path: threadsPath, content: data.markdown });
+      _threads            = data.threads || merged;
+      modal.style.display = 'none';
+      renderThreadsPanel();
+      showToast(`Added ${newThreads.length} thread(s)`, 'success');
+    } else {
+      showToast('Failed to save threads.');
+    }
+  } catch (e) {
+    showToast(`Failed to save threads: ${e.message}`);
+  }
+});

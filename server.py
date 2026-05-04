@@ -748,6 +748,177 @@ async def save_shop_endpoint(req: SaveShopRequest):
 
 
 # ---------------------------------------------------------------------------
+# Thread tracker helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_threads_file(content: str) -> list:
+    """Parse YAML frontmatter from a Plot Threads.md file."""
+    import yaml
+    if not content.startswith("---"):
+        return []
+    end = content.find("\n---", 3)
+    if end < 0:
+        return []
+    front = content[3:end].strip()
+    try:
+        data = yaml.safe_load(front)
+        if isinstance(data, dict) and isinstance(data.get("threads"), list):
+            return data["threads"]
+    except Exception:
+        pass
+    return []
+
+
+def _build_threads_markdown(threads: list) -> str:
+    """Build the full Plot Threads.md content from a list of thread dicts."""
+    import yaml
+    data = {"threads": threads}
+    front = yaml.dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    status_labels = {"active": "Active", "dormant": "Dormant", "resolved": "Resolved"}
+    lines = ["---", front.strip(), "---", "", "# Plot Threads", ""]
+    for t in threads:
+        status = t.get("status", "active")
+        label = status_labels.get(status, status.title())
+        lines.append(f"## {t.get('title', 'Untitled')} ({label})")
+        if t.get("description"):
+            lines.extend(["", t["description"]])
+        pcs = t.get("pcs", [])
+        if pcs:
+            lines.extend(["", "**PCs:**"])
+            for pc in pcs:
+                lines.append(f"- {pc.get('name', '?')} ({pc.get('role', 'involved')})")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _thread_slug(title: str) -> str:
+    slug = re.sub(r"[^\w]+", "-", title.lower()).strip("-")
+    return f"thread-{slug[:40]}"
+
+
+# ---------------------------------------------------------------------------
+# Thread tracker endpoints
+# ---------------------------------------------------------------------------
+
+
+class ThreadsSaveRequest(BaseModel):
+    threads: list[dict]
+
+
+class ThreadStatusRequest(BaseModel):
+    id: str
+    status: str
+
+
+class ThreadsExtractRequest(BaseModel):
+    player_recap: str
+    dm_recap: str = ""
+
+
+@app.get("/threads")
+async def get_threads():
+    """Read and parse Plot Threads.md from the vault."""
+    from config import OBSIDIAN_VAULT
+    threads_path = Path(OBSIDIAN_VAULT) / "03 Story" / "Plot Threads.md"
+    if not threads_path.exists():
+        return {"threads": []}
+    try:
+        content = threads_path.read_text(encoding="utf-8")
+        return {"threads": _parse_threads_file(content)}
+    except Exception as exc:
+        return {"threads": [], "error": str(exc)}
+
+
+@app.post("/threads/save")
+async def save_threads(req: ThreadsSaveRequest):
+    """Generate Plot Threads.md markdown. Frontend writes the file to vault."""
+    existing_ids: set = set()
+    threads_out = []
+    for t in req.threads:
+        t = dict(t)
+        if not t.get("id"):
+            base = _thread_slug(t.get("title", "untitled"))
+            uid = base
+            counter = 2
+            while uid in existing_ids:
+                uid = f"{base}-{counter}"
+                counter += 1
+            t["id"] = uid
+        existing_ids.add(t.get("id", ""))
+        if "status" not in t:
+            t["status"] = "active"
+        threads_out.append(t)
+    return {"markdown": _build_threads_markdown(threads_out), "threads": threads_out}
+
+
+@app.patch("/threads/status")
+async def patch_thread_status(req: ThreadStatusRequest):
+    """Update a single thread's status. Returns updated markdown for frontend to write."""
+    from fastapi import HTTPException
+    valid_statuses = {"active", "dormant", "resolved"}
+    if req.status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {req.status}")
+    from config import OBSIDIAN_VAULT
+    threads_path = Path(OBSIDIAN_VAULT) / "03 Story" / "Plot Threads.md"
+    threads: list = []
+    if threads_path.exists():
+        threads = _parse_threads_file(threads_path.read_text(encoding="utf-8"))
+    updated = False
+    for t in threads:
+        if t.get("id") == req.id:
+            t["status"] = req.status
+            updated = True
+            break
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Thread not found: {req.id}")
+    markdown = _build_threads_markdown(threads)
+    return {"markdown": markdown}
+
+
+@app.post("/threads/extract")
+async def extract_threads(req: ThreadsExtractRequest):
+    """Extract proposed plot threads from session recaps using LLM."""
+    from fastapi import HTTPException
+    if not _state["loaded"]:
+        raise HTTPException(status_code=503, detail="LLM not loaded yet.")
+    from llama_index.core import Settings
+    context = f"Player recap:\n{req.player_recap.strip()}"
+    if req.dm_recap.strip():
+        context += f"\n\nDM notes:\n{req.dm_recap.strip()}"
+    prompt = (
+        "You are a D&D campaign assistant. Extract active plot threads from the session recap below.\n"
+        "Rules:\n"
+        "- Only extract plot threads EXPLICITLY mentioned in the text. Do not invent details.\n"
+        "- A plot thread is an ongoing story arc, quest, conflict, or mystery.\n"
+        "- For each thread, identify which PC names are mentioned in relation to it.\n"
+        "- role = 'involved' if the PC actively engaged with this thread this session.\n"
+        "- role = 'stake' if the PC has a personal interest or connection to this thread.\n"
+        "- Respond ONLY with valid JSON: {\"proposed\": [{\"title\": ..., \"description\": ..., \"pcs\": [{\"name\": ..., \"role\": ...}]}]}.\n"
+        "- If no clear threads can be extracted, return {\"proposed\": []}.\n\n"
+        f"{context}\n\n"
+        "JSON:"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        _reset_token_counter()
+        response = await loop.run_in_executor(None, lambda: Settings.llm.complete(prompt))
+        text = response.text.strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(text[start:end])
+            proposed = data.get("proposed", [])
+            if isinstance(proposed, list):
+                loop.run_in_executor(None, _report_tokens, _read_token_count())
+                return {"proposed": proposed}
+    except Exception as exc:
+        print(f"[server] /threads/extract failed: {exc}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"proposed": []}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
