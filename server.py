@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
-import tiktoken
+import openai as _openai_lib
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,27 +27,34 @@ from pydantic import BaseModel
 
 _TRACKER_URL = "https://token-tracker-roan.vercel.app/api/tokens"
 _DAILY_LIMIT = 250_000
-_enc = tiktoken.encoding_for_model("gpt-4o-mini")  # pre-flight estimates only
 
-# Per-request token counter (reset before each LLM call, read after)
-_token_counter = None
-_token_counter_lock = threading.Lock()
+# Direct OpenAI client for streaming calls (set during index load)
+_openai_client: "_openai_lib.OpenAI | None" = None
 
-
-def _reset_token_counter() -> None:
-    if _token_counter is not None:
-        with _token_counter_lock:
-            _token_counter.reset_counts()
+# Thread-safe usage accumulator for the query engine callback
+_usage_lock = threading.Lock()
+_usage_tokens = 0
 
 
-def _read_token_count() -> int:
-    if _token_counter is None:
-        return 0
-    with _token_counter_lock:
-        return (
-            _token_counter.total_llm_token_count
-            + _token_counter.total_embedding_token_count
-        )
+def _reset_usage() -> None:
+    global _usage_tokens
+    with _usage_lock:
+        _usage_tokens = 0
+
+
+def _add_usage(n: int) -> None:
+    global _usage_tokens
+    with _usage_lock:
+        _usage_tokens += n
+
+
+def _pop_usage() -> int:
+    """Return accumulated tokens and reset to 0."""
+    global _usage_tokens
+    with _usage_lock:
+        n = _usage_tokens
+        _usage_tokens = 0
+        return n
 
 
 def _get_tokens_used() -> int:
@@ -63,6 +70,38 @@ def _report_tokens(count: int) -> None:
         httpx.post(_TRACKER_URL, json={"tokens": count}, timeout=5.0)
     except Exception:
         pass  # fail silently
+
+
+class _LLMUsageCallback:
+    """LlamaIndex callback handler that reads actual usage from OpenAI responses."""
+
+    # Minimal interface required by LlamaIndex's CallbackManager
+    event_starts_to_ignore: list = []
+    event_ends_to_ignore: list = []
+
+    def on_event_start(self, event_type, payload=None, event_id="", **kwargs):
+        return event_id
+
+    def on_event_end(self, event_type, payload=None, event_id="", **kwargs):
+        try:
+            from llama_index.core.callbacks import CBEventType, EventPayload
+            if event_type != CBEventType.LLM or not payload:
+                return
+            resp = payload.get(EventPayload.RESPONSE)
+            raw = getattr(resp, "raw", None)
+            usage = getattr(raw, "usage", None) if raw else None
+            total = getattr(usage, "total_tokens", 0) if usage else 0
+            if total:
+                _add_usage(total)
+        except Exception:
+            pass
+
+    def start_trace(self, trace_id=None):
+        pass
+
+    def end_trace(self, trace_id=None, trace_map=None):
+        pass
+
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -140,7 +179,7 @@ def _load_index() -> None:
             USE_OPENAI_EMBEDDINGS,
         )
         from llama_index.core import Settings, VectorStoreIndex
-        from llama_index.core.callbacks import CallbackManager, TokenCountingHandler
+        from llama_index.core.callbacks import CallbackManager
         from llama_index.core.prompts import PromptTemplate
         from llama_index.core.query_engine import RetrieverQueryEngine
         from llama_index.core.retrievers import QueryFusionRetriever
@@ -150,12 +189,10 @@ def _load_index() -> None:
         import chromadb
 
         _step("Configuring OpenAI LLM...")
-        global _token_counter
-        _token_counter = TokenCountingHandler(
-            tokenizer=tiktoken.encoding_for_model("gpt-4o-mini").encode
-        )
-        Settings.callback_manager = CallbackManager([_token_counter])
+        global _openai_client
+        Settings.callback_manager = CallbackManager([_LLMUsageCallback()])
         Settings.llm = OpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+        _openai_client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
 
         if USE_OPENAI_EMBEDDINGS:
             from llama_index.embeddings.openai import OpenAIEmbedding
@@ -222,7 +259,7 @@ def _load_index() -> None:
             retriever=hybrid_retriever,
             llm=Settings.llm,
             text_qa_template=STRICT_QA_PROMPT,
-            streaming=True,
+            streaming=False,
         )
 
         _state["index"] = index
@@ -400,20 +437,27 @@ async def generate_npcs_endpoint(req: NpcRequest):
             return
 
         try:
-            from llama_index.core import Settings
             import queue as _queue
 
             prompt = _build_npc_prompt(req.location_name, req.population, req.count)
             full_text = ""
             q: _queue.Queue = _queue.Queue()
-            _reset_token_counter()
 
             def stream_thread() -> None:
+                tokens_used = 0
                 try:
-                    for chunk in Settings.llm.stream_complete(prompt):
-                        if chunk.delta:
-                            q.put(("token", chunk.delta))
-                    q.put(("done", None))
+                    stream = _openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    )
+                    for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            q.put(("token", chunk.choices[0].delta.content))
+                        if chunk.usage:
+                            tokens_used = chunk.usage.total_tokens
+                    q.put(("done", tokens_used))
                 except Exception as e:
                     q.put(("error", str(e)))
 
@@ -427,7 +471,7 @@ async def generate_npcs_endpoint(req: NpcRequest):
                     yield f"data: {json.dumps({'token': value})}\n\n"
                 elif kind == "done":
                     yield 'data: {"done": true}\n\n'
-                    loop.run_in_executor(None, _report_tokens, _read_token_count())
+                    loop.run_in_executor(None, _report_tokens, value)
                     break
                 else:
                     yield f"data: {json.dumps({'error': value})}\n\n"
@@ -455,20 +499,27 @@ async def generate_shops_endpoint(req: ShopRequest):
             return
 
         try:
-            from llama_index.core import Settings
             import queue as _queue
 
             prompt = _build_shop_prompt(req.location_name, req.location_content, req.pc_info)
             full_text = ""
             q: _queue.Queue = _queue.Queue()
-            _reset_token_counter()
 
             def stream_thread() -> None:
+                tokens_used = 0
                 try:
-                    for chunk in Settings.llm.stream_complete(prompt):
-                        if chunk.delta:
-                            q.put(("token", chunk.delta))
-                    q.put(("done", None))
+                    stream = _openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    )
+                    for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            q.put(("token", chunk.choices[0].delta.content))
+                        if chunk.usage:
+                            tokens_used = chunk.usage.total_tokens
+                    q.put(("done", tokens_used))
                 except Exception as e:
                     q.put(("error", str(e)))
 
@@ -482,7 +533,7 @@ async def generate_shops_endpoint(req: ShopRequest):
                     yield f"data: {json.dumps({'token': value})}\n\n"
                 elif kind == "done":
                     yield 'data: {"done": true}\n\n'
-                    loop.run_in_executor(None, _report_tokens, _read_token_count())
+                    loop.run_in_executor(None, _report_tokens, value)
                     break
                 else:
                     yield f"data: {json.dumps({'error': value})}\n\n"
@@ -563,13 +614,16 @@ async def query_endpoint(req: QueryRequest):
 
             query_engine = _state["query_engine"]
             q: _queue.Queue = _queue.Queue()
-            _reset_token_counter()
+            _reset_usage()
 
             def query_thread() -> None:
                 try:
                     response = query_engine.query(question)
-                    for token in response.response_gen:
-                        q.put(("token", token, None))
+                    # Non-streaming: chunk the full text to simulate streaming
+                    text = response.response or ""
+                    chunk_size = 20
+                    for i in range(0, len(text), chunk_size):
+                        q.put(("token", text[i:i + chunk_size], None))
                     q.put(("done", None, response))
                 except Exception as e:
                     q.put(("error", str(e), None))
@@ -592,8 +646,8 @@ async def query_endpoint(req: QueryRequest):
                     yield f"data: {payload}\n\n"
                     return
 
-            # Report actual API usage via TokenCountingHandler
-            total_tokens = _read_token_count()
+            # Use actual token count captured by _LLMUsageCallback
+            total_tokens = _pop_usage()
 
             # Report in background (non-blocking)
             loop.run_in_executor(None, _report_tokens, total_tokens)
@@ -901,7 +955,6 @@ async def extract_threads(req: ThreadsExtractRequest):
     )
     loop = asyncio.get_running_loop()
     try:
-        _reset_token_counter()
         response = await loop.run_in_executor(None, lambda: Settings.llm.complete(prompt))
         text = response.text.strip()
         start = text.find("{")
@@ -910,12 +963,100 @@ async def extract_threads(req: ThreadsExtractRequest):
             data = json.loads(text[start:end])
             proposed = data.get("proposed", [])
             if isinstance(proposed, list):
-                loop.run_in_executor(None, _report_tokens, _read_token_count())
+                raw = getattr(response, "raw", None)
+                usage = getattr(raw, "usage", None) if raw else None
+                tokens_used = getattr(usage, "total_tokens", 0) if usage else 0
+                loop.run_in_executor(None, _report_tokens, tokens_used)
                 return {"proposed": proposed}
     except Exception as exc:
         print(f"[server] /threads/extract failed: {exc}", file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(exc))
     return {"proposed": []}
+
+
+# ---------------------------------------------------------------------------
+# Session planner endpoint
+# ---------------------------------------------------------------------------
+
+
+class SessionNextStepsRequest(BaseModel):
+    player_recap: str
+    dm_recap: str = ""
+
+
+@app.post("/session/next-steps")
+async def session_next_steps_endpoint(req: SessionNextStepsRequest):
+    """SSE streaming endpoint: streams next-session prep items from recap text."""
+
+    async def generate() -> AsyncGenerator[str, None]:
+        if not _state["loaded"]:
+            yield f"data: {json.dumps({'error': 'LLM not loaded yet.'})}\n\n"
+            return
+
+        # Token guard
+        loop = asyncio.get_running_loop()
+        used = await loop.run_in_executor(None, _get_tokens_used)
+        if used >= _DAILY_LIMIT:
+            yield f"data: {json.dumps({'limit_exceeded': True, 'used': used, 'limit': _DAILY_LIMIT})}\n\n"
+            return
+
+        try:
+            import queue as _queue
+
+            context = f"Player recap:\n{req.player_recap.strip()}"
+            if req.dm_recap.strip():
+                context += f"\n\nDM notes:\n{req.dm_recap.strip()}"
+
+            prompt = (
+                "You are a D&D campaign assistant. Based ONLY on the session recap below, "
+                "generate actionable next-session prep items for the DM.\n"
+                "Rules:\n"
+                "- Only reference content explicitly mentioned in the recap. Do not invent details.\n"
+                "- Organise items into these categories (omit any category with no items): "
+                "Immediate Follow-ups, NPC Reactions, Loose Ends, Opportunities.\n"
+                "- Each item must be a single concise bullet point.\n\n"
+                f"{context}\n\n"
+                "Next-session prep:"
+            )
+
+            q: _queue.Queue = _queue.Queue()
+
+            def stream_thread() -> None:
+                tokens_used = 0
+                try:
+                    stream = _openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    )
+                    for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            q.put(("token", chunk.choices[0].delta.content))
+                        if chunk.usage:
+                            tokens_used = chunk.usage.total_tokens
+                    q.put(("done", tokens_used))
+                except Exception as e:
+                    q.put(("error", str(e)))
+
+            threading.Thread(target=stream_thread, daemon=True).start()
+
+            while True:
+                kind, value = await loop.run_in_executor(None, q.get)
+                if kind == "token":
+                    yield f"data: {json.dumps({'token': value})}\n\n"
+                elif kind == "done":
+                    yield 'data: {"done": true}\n\n'
+                    loop.run_in_executor(None, _report_tokens, value)
+                    break
+                else:
+                    yield f"data: {json.dumps({'error': value})}\n\n"
+                    break
+
+        except Exception as exc:
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ---------------------------------------------------------------------------

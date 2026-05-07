@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { marked } from 'marked';
 import chevronLeftSvg from 'heroicons/24/outline/chevron-left.svg?raw';
 import chevronRightSvg from 'heroicons/24/outline/chevron-right.svg?raw';
 import userGroupSvg from 'heroicons/24/outline/user-group.svg?raw';
@@ -143,10 +144,28 @@ document.getElementById('app').innerHTML = `
     </div>
 
     <div class="tab-panel" id="panel-session" style="display:none">
-      <div class="panel-placeholder">
-        <div class="placeholder-icon">📜</div>
-        <div class="placeholder-title">Session Planner</div>
-        <div class="placeholder-body">Coming in Phase 2 — auto-discovers latest session recaps and generates next steps.</div>
+      <div class="session-toolbar">
+        <button class="btn btn-primary" id="session-scan-btn">✦ Scan Next Steps</button>
+        <button class="btn btn-ghost" id="session-threads-btn">⚡ Scan Threads</button>
+        <button class="btn btn-ghost" id="session-refresh-btn">↻ Refresh</button>
+      </div>
+      <div class="session-body">
+        <div class="session-recaps" id="session-recaps">
+          <details class="session-recap-panel" id="recap-player-panel">
+            <summary class="recap-summary">Player Recap <span class="recap-filename" id="recap-player-name">—</span></summary>
+            <div class="recap-md" id="recap-player-content">Loading…</div>
+          </details>
+          <details class="session-recap-panel" id="recap-dm-panel">
+            <summary class="recap-summary">DM Element Tables <span class="recap-filename" id="recap-dm-name">—</span></summary>
+            <div class="recap-md" id="recap-dm-content">Loading…</div>
+          </details>
+        </div>
+        <div class="session-next-steps">
+          <div class="session-next-steps-header">Next Session Prep</div>
+          <div class="session-output" id="session-output">
+            <div class="session-output-placeholder" id="session-output-placeholder">Click <strong>Scan Next Steps</strong> to generate next-session prep from the latest recap.</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1269,6 +1288,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-panel').forEach(p => { p.style.display = 'none'; });
     document.getElementById(`panel-${tab}`).style.display = '';
     if (tab === 'threads') loadThreadsTab();
+    if (tab === 'session') loadSessionTab();
   });
 });
 
@@ -1460,12 +1480,12 @@ async function openThreadsScanModal() {
 
   try {
     const [playerRecap, dmRecap] = await Promise.all([
-      findLatestRecap('Player Recaps'),
-      findLatestRecap('DM Element Tables'),
+      findLatestRecap('Recap - Player'),
+      findLatestRecap('Recap - DM - Element Tables'),
     ]);
 
     if (!playerRecap) {
-      body.innerHTML = `<div class="threads-modal-error">No player recap found in <code>03 Story/Sessions/Player Recaps</code>.</div>`;
+      body.innerHTML = `<div class="threads-modal-error">No player recap found in <code>03 Story/Sessions/Recap - Player</code>.</div>`;
       return;
     }
 
@@ -1552,5 +1572,129 @@ document.getElementById('threads-modal-confirm').addEventListener('click', async
     }
   } catch (e) {
     showToast(`Failed to save threads: ${e.message}`);
+  }
+});
+
+// ── Session tab state ────────────────────────────────────────────────────
+let _sessionPlayerRecap = null;
+let _sessionDmRecap = null;
+let _sessionLoaded = false;
+
+// ── Session tab ──────────────────────────────────────────────────────────
+async function loadSessionTab() {
+  if (_sessionLoaded) return;
+  _sessionLoaded = true;
+
+  const playerNameEl    = document.getElementById('recap-player-name');
+  const playerContentEl = document.getElementById('recap-player-content');
+  const dmNameEl        = document.getElementById('recap-dm-name');
+  const dmContentEl     = document.getElementById('recap-dm-content');
+
+  playerNameEl.textContent    = 'Loading\u2026';
+  playerContentEl.textContent = 'Loading\u2026';
+  dmNameEl.textContent        = '\u2014';
+  dmContentEl.textContent     = '\u2014';
+
+  const [playerRecap, dmRecap] = await Promise.all([
+    findLatestRecap('Recap - Player'),
+    findLatestRecap('Recap - DM - Element Tables'),
+  ]);
+
+  _sessionPlayerRecap = playerRecap;
+  _sessionDmRecap     = dmRecap;
+
+  if (playerRecap) {
+    playerNameEl.textContent = playerRecap.name;
+    playerContentEl.innerHTML = marked.parse(playerRecap.content);
+  } else {
+    playerNameEl.textContent  = 'Not found';
+    playerContentEl.textContent = 'No player recap found in 03 Story/Sessions/Recap - Player.';
+  }
+
+  if (dmRecap) {
+    dmNameEl.textContent    = dmRecap.name;
+    dmContentEl.innerHTML   = marked.parse(dmRecap.content);
+  } else {
+    dmNameEl.textContent    = 'Not found';
+    dmContentEl.textContent = 'No DM recap found in 03 Story/Sessions/Recap - DM - Element Tables.';
+  }
+}
+
+document.getElementById('session-refresh-btn').addEventListener('click', () => {
+  _sessionLoaded = false;
+  loadSessionTab();
+});
+
+document.getElementById('session-threads-btn').addEventListener('click', () => {
+  openThreadsScanModal();
+});
+
+document.getElementById('session-scan-btn').addEventListener('click', async () => {
+  if (!_sessionPlayerRecap) {
+    showToast('No player recap loaded. Click Refresh first.');
+    return;
+  }
+
+  const output      = document.getElementById('session-output');
+  const scanBtn     = document.getElementById('session-scan-btn');
+  const placeholder = document.getElementById('session-output-placeholder');
+
+  scanBtn.disabled = true;
+  if (placeholder) placeholder.remove();
+  output.innerHTML = '<pre class="session-stream-pre" id="session-stream-pre"></pre>';
+  const streamPre  = document.getElementById('session-stream-pre');
+
+  // Token pre-flight
+  const used = await refreshTokens();
+  if (used >= DAILY_LIMIT) {
+    const proceed = await confirmLimitModal(used);
+    if (!proceed) {
+      scanBtn.disabled = false;
+      return;
+    }
+  }
+
+  let fullText = '';
+  try {
+    const res = await fetch(`${API}/session/next-steps`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        player_recap: _sessionPlayerRecap.content,
+        dm_recap: _sessionDmRecap?.content || '',
+      }),
+    });
+
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.token) {
+            fullText += data.token;
+            streamPre.textContent = fullText;
+            streamPre.scrollTop   = streamPre.scrollHeight;
+          } else if (data.limit_exceeded) {
+            const proceed = await confirmLimitModal(data.used);
+            if (!proceed) break;
+          } else if (data.error) {
+            streamPre.textContent = `Error: ${data.error}`;
+          }
+        } catch { /* ignore */ }
+      }
+    }
+  } catch (e) {
+    streamPre.textContent = `Connection error: ${e.message}`;
+  } finally {
+    scanBtn.disabled = false;
   }
 });

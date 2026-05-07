@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "heroicons": "^2.2.0"
+    "heroicons": "^2.2.0",
+    "marked": "^18.0.3"
   }
 }

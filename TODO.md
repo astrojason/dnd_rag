@@ -11,27 +11,6 @@
 
 ---
 
-## Phase 0.5 — Web Dev Mode *(do first)*
-
-> Goal: run the full app at http://localhost:1420 via `npm run dev` without building the Tauri binary.
-
-- [ ] **`server.py`** — add 3 FS proxy endpoints (all paths validated to be inside `OBSIDIAN_VAULT`):
-  - `GET /fs/readdir?path=...` → returns `[{ name, path, is_dir }]`
-  - `GET /fs/readfile?path=...` → returns `{ content: "..." }`
-  - `POST /fs/writefile` body `{ path, content }` → writes file, creates parent dirs
-- [ ] **`tauri-app/src/tauri-shim.js`** — new file, exports `invoke(cmd, args)`:
-  - Detects `window.__TAURI__` — if present, delegates to real `@tauri-apps/api/core`
-  - If not (browser dev mode), routes to backend FS proxy:
-    - `read_dir` → `GET /fs/readdir`
-    - `read_text_file` → `GET /fs/readfile`
-    - `write_text_file` → `POST /fs/writefile`
-    - `open_file` → no-op
-- [ ] **`tauri-app/src/main.js`** — change import: `from '@tauri-apps/api/core'` → `from './tauri-shim.js'`
-- [ ] **`tauri-app/src/main.js`** — change API const: `const API = import.meta.env.VITE_API_URL ?? 'http://astroserver:8765'`
-- [ ] **`tauri-app/.env.development`** — new file: `VITE_API_URL=http://localhost:8765`
-
----
-
 ## Phase 0 — Navigation Shell ✓
 
 > Goal: tab nav across the top of the main content area. Sidebar always visible on the right.
@@ -72,11 +51,11 @@ YAML frontmatter = structured data for the app. Body = human-readable for Obsidi
 
 ### Backend (`server.py`)
 
-- [ ] **`POST /session/next-steps`** SSE endpoint — accepts `{ player_recap, dm_recap }`. Strict extraction prompt, no invented content. Streams via `Settings.llm.stream_complete()`. Token-aware.
+- [x] **`POST /session/next-steps`** SSE endpoint — accepts `{ player_recap, dm_recap }`. Strict extraction prompt, no invented content. Streams via `Settings.llm.stream_complete()`. Token-aware.
 
 ### Frontend (`main.js`)
 
-- [ ] **Session tab panel** — auto-discovers latest Player Recap + DM Element Tables recap via `findLatestRecap()`, collapsible raw panels, streams next steps, "Scan Threads from This Recap" bridges to Phase 1 approval modal
+- [x] **Session tab panel** — auto-discovers latest Player Recap + DM Element Tables recap via `findLatestRecap()`, collapsible raw panels, streams next steps, "Scan Threads from This Recap" bridges to Phase 1 approval modal
 
 ---
 
