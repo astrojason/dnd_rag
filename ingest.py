@@ -2,14 +2,12 @@ from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageCon
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.core import Settings
-from llama_index.core.callbacks import CallbackManager, TokenCountingHandler
 import chromadb
 import re
 import sys
 from config import *
 import pickle
 import httpx
-import tiktoken
 
 _TRACKER_URL = "https://token-tracker-roan.vercel.app/api/tokens"
 
@@ -96,13 +94,29 @@ Settings.llm = Ollama(model=QUALITY_MODEL, request_timeout=300.0)
 print("LLM configured")
 
 print("Configuring embeddings...")
-token_counter = TokenCountingHandler(
-    tokenizer=tiktoken.encoding_for_model("text-embedding-3-small").encode
-)
-Settings.callback_manager = CallbackManager([token_counter])
 if USE_OPENAI_EMBEDDINGS:
     from llama_index.embeddings.openai import OpenAIEmbedding
-    Settings.embed_model = OpenAIEmbedding(
+
+    class TrackingOpenAIEmbedding(OpenAIEmbedding):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.actual_token_count = 0
+
+        def _get_text_embeddings(self, texts):
+            response = self._client.embeddings.create(
+                model=self.model, input=texts
+            )
+            self.actual_token_count += response.usage.total_tokens
+            return [item.embedding for item in response.data]
+
+        def _get_query_embedding(self, query):
+            response = self._client.embeddings.create(
+                model=self.model, input=[query]
+            )
+            self.actual_token_count += response.usage.total_tokens
+            return response.data[0].embedding
+
+    Settings.embed_model = TrackingOpenAIEmbedding(
         model="text-embedding-3-small",
         api_key=OPENAI_API_KEY
     )
@@ -217,7 +231,10 @@ with open(nodes_path, 'wb') as f:
 
 print(f"Saved {len(nodes)} nodes for BM25")
 
-# Report actual embedding tokens used as counted by the API callback
-total_tokens = token_counter.total_embedding_token_count
+# Report actual embedding tokens from OpenAI API responses
+if USE_OPENAI_EMBEDDINGS and isinstance(Settings.embed_model, TrackingOpenAIEmbedding):
+    total_tokens = Settings.embed_model.actual_token_count
+else:
+    total_tokens = 0
 print(f"Reporting {total_tokens:,} embedding tokens to tracker...")
 _report_tokens(total_tokens)
