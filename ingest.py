@@ -98,9 +98,7 @@ if USE_OPENAI_EMBEDDINGS:
     from llama_index.embeddings.openai import OpenAIEmbedding
 
     class TrackingOpenAIEmbedding(OpenAIEmbedding):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.actual_token_count = 0
+        actual_token_count: int = 0
 
         def _get_text_embeddings(self, texts):
             response = self._client.embeddings.create(
