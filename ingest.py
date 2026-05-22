@@ -101,14 +101,14 @@ if USE_OPENAI_EMBEDDINGS:
         actual_token_count: int = 0
 
         def _get_text_embeddings(self, texts):
-            response = self._client.embeddings.create(
+            response = self._get_client().embeddings.create(
                 model=self.model, input=texts
             )
             self.actual_token_count += response.usage.total_tokens
             return [item.embedding for item in response.data]
 
         def _get_query_embedding(self, query):
-            response = self._client.embeddings.create(
+            response = self._get_client().embeddings.create(
                 model=self.model, input=[query]
             )
             self.actual_token_count += response.usage.total_tokens
