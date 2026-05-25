@@ -201,12 +201,26 @@ else:
 vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-print("Creating index and persisting to ChromaDB...")
-index = VectorStoreIndex.from_documents(
-    documents,
-    storage_context=storage_context
-)
-print("Index created and saved")
+if rebuild:
+    print("Creating index and persisting to ChromaDB...")
+    index = VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context
+    )
+    print("Index created and saved")
+else:
+    print("Checking for new documents...")
+    existing = chroma_collection.get(include=['metadatas'])
+    indexed_paths = {m.get('file_path', '') for m in existing['metadatas']} if existing.get('metadatas') else set()
+    new_docs = [doc for doc in documents if doc.metadata.get('file_path', '') not in indexed_paths]
+    index = VectorStoreIndex.from_vector_store(vector_store)
+    if new_docs:
+        print(f"Indexing {len(new_docs)} new documents...")
+        for doc in new_docs:
+            index.insert(doc)
+        print(f"Indexed {len(new_docs)} new documents")
+    else:
+        print("No new documents to index")
 
 print("Saving nodes for BM25...")
 # Get all nodes from the index
