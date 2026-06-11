@@ -48,6 +48,7 @@ document.getElementById('app').innerHTML = `
         <button class="tab-btn active" data-tab="oracle">⚔ Oracle</button>
         <button class="tab-btn" data-tab="threads">⚡ Threads</button>
         <button class="tab-btn" data-tab="session">📜 Session</button>
+        <button class="tab-btn" data-tab="vault">📖 Vault</button>
       </nav>
       <main class="chat-area tab-panel" id="panel-oracle">
         <div class="content-overlay" id="content-overlay">
@@ -166,6 +167,27 @@ document.getElementById('app').innerHTML = `
             <div class="session-output-placeholder" id="session-output-placeholder">Click <strong>Scan Next Steps</strong> to generate next-session prep from the latest recap.</div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-vault" style="display:none">
+      <div class="vault-toolbar">
+        <span class="vault-status-text" id="vault-status-text">—</span>
+        <div class="vault-toolbar-actions">
+          <button class="btn btn-ghost" id="vault-scan-btn">↻ Rescan</button>
+          <button class="btn btn-primary" id="vault-suggest-btn">✦ Suggest</button>
+        </div>
+      </div>
+      <div class="vault-controls">
+        <div class="vault-filter-tabs" id="vault-filter-tabs">
+          <button class="vault-filter-btn active" data-filter="all">All</button>
+          <button class="vault-filter-btn" data-filter="blank">Blank</button>
+          <button class="vault-filter-btn" data-filter="stub">Stub</button>
+        </div>
+        <input class="vault-search-input" id="vault-search-input" type="text" placeholder="Search by name…" autocomplete="off">
+      </div>
+      <div class="vault-file-list" id="vault-file-list">
+        <div class="vault-placeholder">Loading vault…</div>
       </div>
     </div>
 
@@ -1289,6 +1311,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.getElementById(`panel-${tab}`).style.display = '';
     if (tab === 'threads') loadThreadsTab();
     if (tab === 'session') loadSessionTab();
+    if (tab === 'vault') loadVaultTab();
   });
 });
 
@@ -1697,4 +1720,191 @@ document.getElementById('session-scan-btn').addEventListener('click', async () =
   } finally {
     scanBtn.disabled = false;
   }
+});
+
+// ── Vault Curator tab ───────────────────────────────────────────────────
+// Runs entirely client-side via Tauri IPC — vault lives on the local Mac,
+// not on the remote server.
+
+const VAULT_IGNORE_DIRS = new Set(['.obsidian', 'Templates', '.trash']);
+const VAULT_PREFER_TAGS = ['npc', 'location', 'quest'];
+const VAULT_STUB_BYTES = 40;
+
+const _vaultFrontMatterRe = /^---\s*\n[\s\S]*?\n---\s*\n/;
+const _vaultHeaderRe = /^\s*#{1,6}\s+.*/gm;
+const _vaultLinkLineRe = /^\s*\[\[.+?\]\]\s*$/gm;
+const _vaultTagRe = /#([\w][\w/-]*)/g;
+
+function _vaultStripMetadata(text) {
+  return text
+    .replace(_vaultFrontMatterRe, '')
+    .replace(_vaultHeaderRe, '')
+    .replace(_vaultLinkLineRe, '')
+    .trim();
+}
+
+function _vaultIsBlank(content) {
+  if (!content) return true;
+  return !_vaultStripMetadata(content);
+}
+
+function _vaultIsStub(content) {
+  if (!content || _vaultIsBlank(content)) return false;
+  const stripped = _vaultStripMetadata(content);
+  return new TextEncoder().encode(stripped).length < VAULT_STUB_BYTES;
+}
+
+function _vaultExtractTags(content) {
+  const tags = new Set();
+  let m;
+  _vaultTagRe.lastIndex = 0;
+  while ((m = _vaultTagRe.exec(content)) !== null) tags.add(m[1].toLowerCase());
+  return [...tags];
+}
+
+async function _vaultScanDir(dirPath) {
+  const files = [];
+  let entries;
+  try { entries = await invoke('read_dir', { path: dirPath }); } catch { return files; }
+  for (const entry of entries) {
+    if (entry.is_dir) {
+      if (!VAULT_IGNORE_DIRS.has(entry.name)) {
+        files.push(...await _vaultScanDir(entry.path));
+      }
+    } else if (entry.name.endsWith('.md')) {
+      try {
+        const content = await invoke('read_text_file', { path: entry.path });
+        const blank = _vaultIsBlank(content);
+        const stub = _vaultIsStub(content);
+        const tags = _vaultExtractTags(content);
+        const relPath = entry.path.slice(VAULT_PATH.length + 1);
+        files.push({ name: entry.name.replace(/\.md$/, ''), path: entry.path, rel_path: relPath, blank, stub, tags });
+      } catch { /* skip unreadable */ }
+    }
+  }
+  return files;
+}
+
+let _vaultAllFiles = null;
+let _vaultFilter = 'all';
+let _vaultSearchQuery = '';
+let _vaultSearchTimeout = null;
+
+async function loadVaultTab() {
+  if (_vaultAllFiles !== null) return;
+  document.getElementById('vault-file-list').innerHTML = '<div class="vault-placeholder">Scanning vault…</div>';
+  document.getElementById('vault-scan-btn').disabled = true;
+  try {
+    _vaultAllFiles = await _vaultScanDir(VAULT_PATH);
+    _vaultAllFiles.sort((a, b) => a.name.localeCompare(b.name));
+    _updateVaultStatus();
+    _renderVaultFileList(_vaultFilteredFiles());
+  } catch (e) {
+    document.getElementById('vault-file-list').innerHTML =
+      `<div class="vault-placeholder vault-error">Scan failed: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    document.getElementById('vault-scan-btn').disabled = false;
+  }
+}
+
+function _updateVaultStatus() {
+  if (!_vaultAllFiles) return;
+  const blank = _vaultAllFiles.filter(f => f.blank).length;
+  const stub  = _vaultAllFiles.filter(f => f.stub).length;
+  document.getElementById('vault-status-text').textContent =
+    `${blank} blank · ${stub} stub · ${_vaultAllFiles.length} total`;
+}
+
+function _vaultFilteredFiles() {
+  let files = _vaultAllFiles || [];
+  const q = _vaultSearchQuery.trim().toLowerCase();
+  if (q) return files.filter(f => f.name.toLowerCase().includes(q)).slice(0, 100);
+  if (_vaultFilter === 'blank') return files.filter(f => f.blank);
+  if (_vaultFilter === 'stub')  return files.filter(f => f.stub);
+  return files;
+}
+
+function _renderVaultFileList(files) {
+  const list = document.getElementById('vault-file-list');
+  if (!files || files.length === 0) {
+    list.innerHTML = '<div class="vault-placeholder">No files found.</div>';
+    return;
+  }
+  list.innerHTML = files.map(f => {
+    const badge = f.blank
+      ? '<span class="vault-badge vault-badge-blank">blank</span>'
+      : f.stub ? '<span class="vault-badge vault-badge-stub">stub</span>' : '';
+    const folder = f.rel_path.split('/').slice(0, -1).join(' / ');
+    return `<div class="vault-file-item" data-path="${escapeHtml(f.path)}">
+      <div class="vault-file-name">${escapeHtml(f.name)}${badge}</div>
+      ${folder ? `<div class="vault-file-folder">${escapeHtml(folder)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function _highlightVaultSuggestion(path) {
+  document.querySelectorAll('.vault-file-item').forEach(item => {
+    item.classList.toggle('vault-file-suggested', item.dataset.path === path);
+  });
+  const suggested = document.querySelector('.vault-file-suggested');
+  if (suggested) suggested.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// Event delegation for file list clicks
+document.getElementById('vault-file-list').addEventListener('click', e => {
+  const item = e.target.closest('.vault-file-item');
+  if (!item) return;
+  const url = buildObsidianUrl(item.dataset.path);
+  if (url) invoke('open_file', { path: url });
+});
+
+document.getElementById('vault-scan-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('vault-scan-btn');
+  btn.disabled = true;
+  btn.textContent = '↻ Scanning…';
+  _vaultAllFiles = null;
+  document.getElementById('vault-file-list').innerHTML = '<div class="vault-placeholder">Scanning vault…</div>';
+  try {
+    _vaultAllFiles = await _vaultScanDir(VAULT_PATH);
+    _vaultAllFiles.sort((a, b) => a.name.localeCompare(b.name));
+    _updateVaultStatus();
+    _renderVaultFileList(_vaultFilteredFiles());
+    showToast('Vault scan complete', 'success');
+  } catch (e) {
+    showToast(`Scan failed: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↻ Rescan';
+  }
+});
+
+document.getElementById('vault-suggest-btn').addEventListener('click', () => {
+  if (!_vaultAllFiles) { showToast('Vault not yet scanned.'); return; }
+  const candidates = _vaultAllFiles.filter(f => f.blank || f.stub);
+  if (!candidates.length) { showToast('No blank or stub notes found.', 'success'); return; }
+  const preferred = candidates.filter(f => f.tags.some(t => VAULT_PREFER_TAGS.includes(t)));
+  const pool = preferred.length ? preferred : candidates;
+  const choice = pool[Math.floor(Math.random() * pool.length)];
+  const url = buildObsidianUrl(choice.path);
+  if (url) invoke('open_file', { path: url });
+  _renderVaultFileList(_vaultFilteredFiles());
+  requestAnimationFrame(() => _highlightVaultSuggestion(choice.path));
+});
+
+document.querySelectorAll('.vault-filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    _vaultFilter = btn.dataset.filter;
+    _vaultSearchQuery = '';
+    document.getElementById('vault-search-input').value = '';
+    document.querySelectorAll('.vault-filter-btn').forEach(b => b.classList.toggle('active', b === btn));
+    if (_vaultAllFiles !== null) _renderVaultFileList(_vaultFilteredFiles());
+  });
+});
+
+document.getElementById('vault-search-input').addEventListener('input', e => {
+  _vaultSearchQuery = e.target.value;
+  clearTimeout(_vaultSearchTimeout);
+  _vaultSearchTimeout = setTimeout(() => {
+    if (_vaultAllFiles !== null) _renderVaultFileList(_vaultFilteredFiles());
+  }, 200);
 });
