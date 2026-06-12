@@ -13,6 +13,12 @@ const API = 'http://astroserver:8765';
 const VAULT_PATH = "/Users/jasonsylvester/Documents/Obsidian/Azorian's Bounty";
 const VAULT_NAME = VAULT_PATH.split('/').pop();
 
+// ── RPGManager entity → vault directory mapping ───────────────────────────
+const LINKS_ENTITY_DIRS = {
+  npcs:      '02 Characters/NPCs',
+  locations: '01 World/Locations',
+};
+
 // ── RPGManager / Turso (direct — no server dependency) ───────────────────
 const TURSO_URL   = 'https://rpgmanager-astrojason.aws-us-west-2.turso.io';
 const TURSO_TOKEN = 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3NTgwNDI5MDgsImlkIjoiODkwMGQ2ZTItM2VkNC00ZTQyLTkxMDItYmM5NmVhN2IxMDFjIiwicmlkIjoiOGU5MTYxMzktNjliNS00NjBkLThjZTUtZWJhZmM3ZGI4NmM2In0.StugZfNHCPgJA5JpcG4xgZ8ie-g_rzUUx7K9pYfoD9CtLthNIKGc-bOMUb7PqdKW5u945rS2ixHlwF0E-KXlCQ';
@@ -1964,8 +1970,10 @@ let _linksAllFiles = [];          // all vault .md files (for the picker)
 let _linksLoaded = false;
 let _linksSearchQuery = '';
 let _linksSearchTimeout = null;
-let _linksExpandedId = null;      // id of currently expanded row
-let _linksVaultContentCache = {}; // id -> rendered HTML string
+let _linksExpandedId = null;          // DB entity id of expanded row
+let _linksExpandedVaultPath = null;   // vault-only file path of expanded row
+let _linksVaultOnly = [];             // vault files in entity dir with no DB link
+let _linksVaultContentCache = {};     // key -> rendered HTML string
 
 // ── Frontmatter helpers ──────────────────────────────────────────────────
 
@@ -2050,6 +2058,14 @@ async function loadLinksTab(force = false) {
     _linksEntities = entities;
     _linksAllFiles = vaultRes.all;
     _linksVaultMap = vaultRes.map;
+
+    // Vault files in the entity directory that aren't linked to any DB entry
+    const entityDir = LINKS_ENTITY_DIRS[_linksEntityType] || '';
+    const linkedPaths = new Set(Object.values(_linksVaultMap).map(f => f.path));
+    _linksVaultOnly = entityDir
+      ? vaultRes.all.filter(f => f.relPath.startsWith(entityDir) && !linkedPaths.has(f.path))
+      : [];
+
     _linksLoaded = true;
     _renderLinksList();
   } catch (e) {
@@ -2062,23 +2078,25 @@ function _renderLinksList() {
   const q = _linksSearchQuery.trim().toLowerCase();
   let entities = _linksEntities;
   if (q) entities = entities.filter(e => (e.name || '').toLowerCase().includes(q));
+  let vaultOnly = _linksVaultOnly;
+  if (q) vaultOnly = vaultOnly.filter(f => f.name.toLowerCase().includes(q));
 
   const linkedCount   = entities.filter(e => _linksVaultMap[String(e.id)]).length;
   const unlinkedCount = entities.length - linkedCount;
   document.getElementById('links-status').textContent =
-    `${linkedCount} linked · ${unlinkedCount} unlinked · ${entities.length} total`;
+    `${linkedCount} linked · ${unlinkedCount} unlinked · ${vaultOnly.length} vault-only · ${entities.length + vaultOnly.length} total`;
 
-  if (entities.length === 0) {
+  if (entities.length === 0 && vaultOnly.length === 0) {
     document.getElementById('links-list').innerHTML = '<div class="vault-placeholder">No entries found.</div>';
     return;
   }
 
-  document.getElementById('links-list').innerHTML = entities.map((e, idx) => {
-    const idStr     = String(e.id);
-    const linked    = _linksVaultMap[idStr];
-    const expanded  = _linksExpandedId === idStr;
+  const dbRows = entities.map((e, idx) => {
+    const idStr      = String(e.id);
+    const linked     = _linksVaultMap[idStr];
+    const expanded   = _linksExpandedId === idStr;
     const zebraClass = idx % 2 === 1 ? ' links-row-alt' : '';
-    const expandedClass = expanded ? ' links-row-expanded' : '';
+    const expClass   = expanded ? ' links-row-expanded' : '';
     const sub = e.pronunciation
       ? `<span class="links-sub">${escapeHtml(e.pronunciation)}</span>`
       : e.teaser
@@ -2086,7 +2104,7 @@ function _renderLinksList() {
         : '';
 
     const rowHtml = linked
-      ? `<div class="links-row${zebraClass}${expandedClass}" data-id="${idStr}">
+      ? `<div class="links-row${zebraClass}${expClass}" data-id="${idStr}">
           <div class="links-indicator links-ind-on" title="Linked"></div>
           <div class="links-row-body">
             <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
@@ -2097,8 +2115,8 @@ function _renderLinksList() {
             <button class="btn btn-ghost btn-xs links-unlink-btn" data-id="${idStr}" data-path="${escapeHtml(linked.path)}">Unlink</button>
           </div>
         </div>`
-      : `<div class="links-row links-row-dim${zebraClass}${expandedClass}" data-id="${idStr}">
-          <div class="links-indicator links-ind-off" title="Unlinked"></div>
+      : `<div class="links-row links-row-dim${zebraClass}${expClass}" data-id="${idStr}">
+          <div class="links-indicator links-ind-off" title="DB only"></div>
           <div class="links-row-body">
             <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
           </div>
@@ -2108,7 +2126,7 @@ function _renderLinksList() {
         </div>`;
 
     const detailHtml = expanded ? `
-      <div class="links-detail" id="links-detail-${idStr}">
+      <div class="links-detail" id="links-detail-db-${idStr}">
         <div class="links-detail-grid">
           <div class="links-detail-col">
             <div class="links-detail-head">RPGManager</div>
@@ -2116,7 +2134,7 @@ function _renderLinksList() {
           </div>
           <div class="links-detail-col">
             <div class="links-detail-head">Vault</div>
-            <div class="links-vault-content" id="links-vault-${idStr}">
+            <div class="links-vault-content" id="links-vault-db-${idStr}">
               ${linked ? '<span class="text-dim">Loading…</span>' : '<span class="links-unlinked-note">Not linked — click Link to connect a vault file.</span>'}
             </div>
           </div>
@@ -2124,12 +2142,59 @@ function _renderLinksList() {
       </div>` : '';
 
     return rowHtml + detailHtml;
-  }).join('');
+  });
 
-  // Async: load vault content for expanded row if linked
+  const vaultSep = vaultOnly.length > 0
+    ? `<div class="links-section-sep">Vault only (${vaultOnly.length})</div>`
+    : '';
+
+  const vaultRows = vaultOnly.map((f, idx) => {
+    const safePath  = escapeHtml(f.path);
+    const expanded  = _linksExpandedVaultPath === f.path;
+    const zebraClass = idx % 2 === 1 ? ' links-row-alt' : '';
+    const expClass   = expanded ? ' links-row-expanded' : '';
+
+    const rowHtml = `<div class="links-row links-row-vault${zebraClass}${expClass}" data-vault-path="${safePath}">
+      <div class="links-indicator links-ind-vault" title="Vault only"></div>
+      <div class="links-row-body">
+        <div class="links-row-name">${escapeHtml(f.name)}</div>
+        <div class="links-row-path">${escapeHtml(f.relPath)}</div>
+      </div>
+      <div class="links-row-btns">
+        <button class="btn btn-ghost btn-xs links-open-btn" data-path="${safePath}">Open</button>
+        <button class="btn btn-ghost btn-xs links-vault-link-btn" data-path="${safePath}" data-name="${escapeHtml(f.name)}">Link to DB</button>
+      </div>
+    </div>`;
+
+    const detailHtml = expanded ? `
+      <div class="links-detail" id="links-detail-vault-${idx}">
+        <div class="links-detail-grid">
+          <div class="links-detail-col">
+            <div class="links-detail-head">RPGManager</div>
+            <span class="links-unlinked-note">Not in RPGManager — click Link to DB to connect.</span>
+          </div>
+          <div class="links-detail-col">
+            <div class="links-detail-head">Vault</div>
+            <div class="links-vault-content" id="links-vault-vaultonly-${idx}">
+              <span class="text-dim">Loading…</span>
+            </div>
+          </div>
+        </div>
+      </div>` : '';
+
+    return rowHtml + detailHtml;
+  });
+
+  document.getElementById('links-list').innerHTML = dbRows.join('') + vaultSep + vaultRows.join('');
+
+  // Async: load vault content for whichever row is expanded
   if (_linksExpandedId) {
     const linked = _linksVaultMap[_linksExpandedId];
-    if (linked) _loadVaultContent(_linksExpandedId, linked.path);
+    if (linked) _loadVaultContent(`db-${_linksExpandedId}`, linked.path);
+  }
+  if (_linksExpandedVaultPath) {
+    const idx = vaultOnly.findIndex(f => f.path === _linksExpandedVaultPath);
+    if (idx >= 0) _loadVaultContent(`vaultonly-${idx}`, _linksExpandedVaultPath);
   }
 }
 
@@ -2146,25 +2211,25 @@ function _renderDbFields(entity) {
     .join('');
 }
 
-async function _loadVaultContent(id, filePath) {
-  if (_linksVaultContentCache[id]) {
-    _updateVaultEl(id, _linksVaultContentCache[id]);
+async function _loadVaultContent(key, filePath) {
+  if (_linksVaultContentCache[key]) {
+    _updateVaultEl(key, _linksVaultContentCache[key]);
     return;
   }
   try {
-    const raw = await invoke('read_text_file', { path: filePath });
-    const fm  = _parseFm(raw);
+    const raw  = await invoke('read_text_file', { path: filePath });
+    const fm   = _parseFm(raw);
     const body = (fm ? fm.body : raw).slice(0, 4000);
     const html = marked.parse(body);
-    _linksVaultContentCache[id] = html;
-    _updateVaultEl(id, html);
+    _linksVaultContentCache[key] = html;
+    _updateVaultEl(key, html);
   } catch (err) {
-    _updateVaultEl(id, `<span class="text-dim">Could not read file: ${escapeHtml(err.message)}</span>`);
+    _updateVaultEl(key, `<span class="text-dim">Could not read file: ${escapeHtml(err.message)}</span>`);
   }
 }
 
-function _updateVaultEl(id, html) {
-  const el = document.getElementById(`links-vault-${id}`);
+function _updateVaultEl(key, html) {
+  const el = document.getElementById(`links-vault-${key}`);
   if (el) el.innerHTML = html;
 }
 
@@ -2211,9 +2276,14 @@ function _openLinkPicker(id, entityName) {
 
     function renderPicker(query) {
       const q = query.trim().toLowerCase();
+      const entityDir    = LINKS_ENTITY_DIRS[_linksEntityType] || '';
+      const linkedPaths  = new Set(Object.values(_linksVaultMap).map(f => f.path));
+      const pool = _linksAllFiles.filter(f =>
+        (!entityDir || f.relPath.startsWith(entityDir)) && !linkedPaths.has(f.path)
+      );
       const files = (q
-        ? _linksAllFiles.filter(f => f.name.toLowerCase().includes(q) || f.relPath.toLowerCase().includes(q))
-        : _linksAllFiles
+        ? pool.filter(f => f.name.toLowerCase().includes(q) || f.relPath.toLowerCase().includes(q))
+        : pool
       ).slice(0, 80);
 
       list.innerHTML = files.length
@@ -2253,12 +2323,68 @@ function _openLinkPicker(id, entityName) {
   });
 }
 
+// ── DB entity picker (for vault-only → link to DB entry) ─────────────────
+
+async function _openDbEntityPicker(filePath, fileName) {
+  const unlinked = _linksEntities.filter(e => !_linksVaultMap[String(e.id)]);
+
+  return new Promise(resolve => {
+    const modal  = document.getElementById('links-pick-modal');
+    const title  = document.getElementById('links-pick-title');
+    const search = document.getElementById('links-pick-search');
+    const list   = document.getElementById('links-pick-list');
+    const cancel = document.getElementById('links-pick-cancel');
+
+    title.textContent = `Link "${fileName}" to DB Entry`;
+    search.value = fileName;
+    modal.style.display = 'flex';
+
+    function renderPicker(query) {
+      const q = query.trim().toLowerCase();
+      const pool = q ? unlinked.filter(e => (e.name || '').toLowerCase().includes(q)) : unlinked;
+      list.innerHTML = pool.length
+        ? pool.slice(0, 80).map(e => `<div class="links-pick-item" data-id="${escapeHtml(String(e.id))}">
+            <div class="links-pick-name">${escapeHtml(e.name || '—')}</div>
+            ${e.pronunciation ? `<div class="links-pick-folder">${escapeHtml(e.pronunciation)}</div>` : ''}
+          </div>`).join('')
+        : '<div class="vault-placeholder">No unlinked entries.</div>';
+    }
+
+    renderPicker(fileName);
+    requestAnimationFrame(() => { search.focus(); search.select(); });
+
+    let st = null;
+    const onInput = () => { clearTimeout(st); st = setTimeout(() => renderPicker(search.value), 150); };
+    const onPick  = async e => {
+      const item = e.target.closest('.links-pick-item');
+      if (!item) return;
+      cleanup(); resolve(item.dataset.id);
+      await _doLink(item.dataset.id, filePath);
+      // Move from vaultOnly to linked in state
+      _linksVaultOnly = _linksVaultOnly.filter(f => f.path !== filePath);
+    };
+    const onCancel = () => { cleanup(); resolve(null); };
+
+    function cleanup() {
+      modal.style.display = 'none';
+      search.removeEventListener('input', onInput);
+      list.removeEventListener('click', onPick);
+      cancel.removeEventListener('click', onCancel);
+    }
+
+    search.addEventListener('input', onInput);
+    list.addEventListener('click', onPick);
+    cancel.addEventListener('click', onCancel);
+  });
+}
+
 // ── Event delegation for links list ──────────────────────────────────────
 
 document.getElementById('links-list').addEventListener('click', async e => {
-  const openBtn   = e.target.closest('.links-open-btn');
-  const unlinkBtn = e.target.closest('.links-unlink-btn');
-  const linkBtn   = e.target.closest('.links-link-btn');
+  const openBtn      = e.target.closest('.links-open-btn');
+  const unlinkBtn    = e.target.closest('.links-unlink-btn');
+  const linkBtn      = e.target.closest('.links-link-btn');
+  const vaultLinkBtn = e.target.closest('.links-vault-link-btn');
 
   if (openBtn) {
     const url = buildObsidianUrl(openBtn.dataset.path);
@@ -2267,11 +2393,20 @@ document.getElementById('links-list').addEventListener('click', async e => {
     await _doUnlink(unlinkBtn.dataset.id, unlinkBtn.dataset.path);
   } else if (linkBtn) {
     await _openLinkPicker(linkBtn.dataset.id, linkBtn.dataset.name);
+  } else if (vaultLinkBtn) {
+    await _openDbEntityPicker(vaultLinkBtn.dataset.path, vaultLinkBtn.dataset.name);
   } else {
     const row = e.target.closest('.links-row');
     if (row) {
-      const id = row.dataset.id;
-      _linksExpandedId = _linksExpandedId === id ? null : id;
+      if (row.dataset.id) {
+        const id = row.dataset.id;
+        _linksExpandedId = _linksExpandedId === id ? null : id;
+        _linksExpandedVaultPath = null;
+      } else if (row.dataset.vaultPath) {
+        const path = row.dataset.vaultPath;
+        _linksExpandedVaultPath = _linksExpandedVaultPath === path ? null : path;
+        _linksExpandedId = null;
+      }
       _renderLinksList();
     }
   }
@@ -2281,6 +2416,7 @@ document.getElementById('links-type-select').addEventListener('change', e => {
   _linksEntityType = e.target.value;
   _linksLoaded = false;
   _linksExpandedId = null;
+  _linksExpandedVaultPath = null;
   _linksVaultContentCache = {};
   loadLinksTab();
 });
@@ -2288,6 +2424,7 @@ document.getElementById('links-type-select').addEventListener('change', e => {
 document.getElementById('links-refresh-btn').addEventListener('click', () => {
   _linksLoaded = false;
   _linksExpandedId = null;
+  _linksExpandedVaultPath = null;
   _linksVaultContentCache = {};
   loadLinksTab(true);
 });
