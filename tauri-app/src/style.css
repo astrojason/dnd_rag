@@ -2040,16 +2040,73 @@ details[open] .recap-summary::before { transform: rotate(90deg); }
 .links-vault-content {
   font-size: 13px;
   color: var(--text-secondary);
-  line-height: 1.6;
+  line-height: 1.7;
 }
-.links-vault-content h1, .links-vault-content h2, .links-vault-content h3 {
+.links-vault-content h1 {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-family: var(--font-display);
+  letter-spacing: 0.03em;
+}
+.links-vault-content h2 {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 14px 0 5px;
+  letter-spacing: 0.02em;
+}
+.links-vault-content h3 {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
   margin: 10px 0 4px;
 }
-.links-vault-content p { margin: 0 0 6px; }
-.links-vault-content ul, .links-vault-content ol { padding-left: 16px; margin: 0 0 6px; }
+.links-vault-content p { margin: 0 0 8px; }
+.links-vault-content p:last-child { margin-bottom: 0; }
+.links-vault-content ul, .links-vault-content ol { padding-left: 18px; margin: 0 0 8px; }
+.links-vault-content li { margin-bottom: 2px; }
+.links-vault-content strong { color: var(--text-primary); font-weight: 600; }
+.links-vault-content em { color: var(--text-secondary); font-style: italic; }
+.links-vault-content code {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  color: var(--gold-bright);
+}
+.links-vault-content pre {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin: 0 0 8px;
+  overflow-x: auto;
+}
+.links-vault-content pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.links-vault-content blockquote {
+  border-left: 3px solid var(--border-gold);
+  margin: 0 0 8px;
+  padding: 2px 0 2px 12px;
+  color: var(--text-dim);
+}
+.links-vault-content hr {
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  margin: 12px 0;
+}
+.links-vault-content a { color: var(--gold-bright); text-decoration: underline; }
 
 .links-unlinked-note {
   font-size: 12px;
