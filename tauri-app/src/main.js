@@ -13,6 +13,24 @@ const API = 'http://astroserver:8765';
 const VAULT_PATH = "/Users/jasonsylvester/Documents/Obsidian/Azorian's Bounty";
 const VAULT_NAME = VAULT_PATH.split('/').pop();
 
+// ── RPGManager / Turso (direct — no server dependency) ───────────────────
+const TURSO_URL   = 'https://rpgmanager-astrojason.aws-us-west-2.turso.io';
+const TURSO_TOKEN = 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3NTgwNDI5MDgsImlkIjoiODkwMGQ2ZTItM2VkNC00ZTQyLTkxMDItYmM5NmVhN2IxMDFjIiwicmlkIjoiOGU5MTYxMzktNjliNS00NjBkLThjZTUtZWJhZmM3ZGI4NmM2In0.StugZfNHCPgJA5JpcG4xgZ8ie-g_rzUUx7K9pYfoD9CtLthNIKGc-bOMUb7PqdKW5u945rS2ixHlwF0E-KXlCQ';
+
+async function tursoQuery(sql) {
+  const res = await fetch(`${TURSO_URL}/v2/pipeline`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${TURSO_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ requests: [{ type: 'execute', stmt: { sql } }, { type: 'close' }] }),
+  });
+  const data = await res.json();
+  const result = data.results[0].response.result;
+  const cols = result.cols.map(c => c.name);
+  return result.rows.map(row =>
+    Object.fromEntries(cols.map((col, i) => [col, row[i].type === 'null' ? null : row[i].value]))
+  );
+}
+
 function buildObsidianUrl(filePath) {
   if (!filePath) return null;
   // file_path in metadata is the Mac path from ingest time — strip vault prefix
@@ -49,6 +67,7 @@ document.getElementById('app').innerHTML = `
         <button class="tab-btn" data-tab="threads">⚡ Threads</button>
         <button class="tab-btn" data-tab="session">📜 Session</button>
         <button class="tab-btn" data-tab="vault">📖 Vault</button>
+        <button class="tab-btn" data-tab="links">🔗 Links</button>
       </nav>
       <main class="chat-area tab-panel" id="panel-oracle">
         <div class="content-overlay" id="content-overlay">
@@ -188,6 +207,21 @@ document.getElementById('app').innerHTML = `
       </div>
       <div class="vault-file-list" id="vault-file-list">
         <div class="vault-placeholder">Loading vault…</div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-links" style="display:none">
+      <div class="links-toolbar">
+        <select class="tool-select links-type-select" id="links-type-select">
+          <option value="npcs">NPCs</option>
+          <option value="locations">Locations</option>
+        </select>
+        <input class="vault-search-input links-search-input" id="links-search" type="text" placeholder="Search…" autocomplete="off">
+        <button class="btn btn-ghost" id="links-refresh-btn">↻ Refresh</button>
+      </div>
+      <div class="links-status" id="links-status">—</div>
+      <div class="links-list" id="links-list">
+        <div class="vault-placeholder">Select a tab to load entities.</div>
       </div>
     </div>
 
@@ -348,6 +382,17 @@ document.getElementById('app').innerHTML = `
       <div class="modal-actions">
         <button class="btn btn-ghost" id="modal-cancel">Cancel</button>
         <button class="btn btn-primary" id="modal-confirm">Proceed Anyway</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="links-pick-modal" style="display:none">
+    <div class="modal links-pick-modal-inner">
+      <div class="modal-title" id="links-pick-title">Link to Vault File</div>
+      <input class="vault-search-input" id="links-pick-search" type="text" placeholder="Search vault files…" autocomplete="off">
+      <div class="links-pick-list" id="links-pick-list"></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="links-pick-cancel">Cancel</button>
       </div>
     </div>
   </div>
@@ -1312,6 +1357,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (tab === 'threads') loadThreadsTab();
     if (tab === 'session') loadSessionTab();
     if (tab === 'vault') loadVaultTab();
+    if (tab === 'links') loadLinksTab();
   });
 });
 
@@ -1907,4 +1953,274 @@ document.getElementById('vault-search-input').addEventListener('input', e => {
   _vaultSearchTimeout = setTimeout(() => {
     if (_vaultAllFiles !== null) _renderVaultFileList(_vaultFilteredFiles());
   }, 200);
+});
+
+// ── Links tab ────────────────────────────────────────────────────────────
+
+let _linksEntityType = 'npcs';
+let _linksEntities = [];
+let _linksVaultMap = {};   // rpgmanager_id (string) -> {name, path, relPath}
+let _linksAllFiles = [];   // all vault .md files (for the picker)
+let _linksLoaded = false;
+let _linksSearchQuery = '';
+let _linksSearchTimeout = null;
+
+// ── Frontmatter helpers ──────────────────────────────────────────────────
+
+function _parseFm(content) {
+  if (!content.startsWith('---\n')) return null;
+  const close = content.indexOf('\n---\n', 4);
+  if (close < 0) return null;
+  return { front: content.slice(4, close), body: content.slice(close + 5) };
+}
+
+function _fmGetField(content, field) {
+  const fm = _parseFm(content);
+  if (!fm) return null;
+  const m = fm.front.match(new RegExp(`^${field}:\\s*(.+)$`, 'm'));
+  return m ? m[1].trim() : null;
+}
+
+function _fmSetField(content, field, value) {
+  const fm = _parseFm(content);
+  if (!fm) return `---\n${field}: ${value}\n---\n\n${content}`;
+  const re = new RegExp(`^${field}:.*$`, 'm');
+  const newFront = re.test(fm.front)
+    ? fm.front.replace(re, `${field}: ${value}`)
+    : fm.front.trimEnd() + `\n${field}: ${value}`;
+  return `---\n${newFront}\n---\n${fm.body}`;
+}
+
+function _fmRemoveField(content, field) {
+  const fm = _parseFm(content);
+  if (!fm) return content;
+  const newFront = fm.front.replace(new RegExp(`\\n?^${field}:.*$`, 'm'), '').trim();
+  if (!newFront) return fm.body;
+  return `---\n${newFront}\n---\n${fm.body}`;
+}
+
+// ── Vault scan for existing links ─────────────────────────────────────────
+
+async function _scanVaultForLinks() {
+  const all = [];
+  const map = {};
+
+  async function scanDir(dirPath) {
+    let entries;
+    try { entries = await invoke('read_dir', { path: dirPath }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.is_dir) {
+        if (!VAULT_IGNORE_DIRS.has(entry.name)) await scanDir(entry.path);
+      } else if (entry.name.endsWith('.md')) {
+        const relPath = entry.path.slice(VAULT_PATH.length + 1);
+        const name = entry.name.replace(/\.md$/, '');
+        const info = { name, path: entry.path, relPath };
+        all.push(info);
+        try {
+          const content = await invoke('read_text_file', { path: entry.path });
+          const id = _fmGetField(content, 'rpgmanager_id');
+          if (id) map[id] = info;
+        } catch { /* skip unreadable */ }
+      }
+    }
+  }
+
+  await scanDir(VAULT_PATH);
+  return { all, map };
+}
+
+// ── Load / render ─────────────────────────────────────────────────────────
+
+async function loadLinksTab(force = false) {
+  if (_linksLoaded && !force) return;
+  document.getElementById('links-status').textContent = 'Loading…';
+  document.getElementById('links-list').innerHTML = '<div class="vault-placeholder">Scanning…</div>';
+
+  try {
+    const SQL = {
+      npcs:      'SELECT id, name, pronunciation, race, gender, status FROM npcs ORDER BY name',
+      locations: 'SELECT id, name, pronunciation, teaser FROM locations ORDER BY name',
+    };
+    const [entities, vaultRes] = await Promise.all([
+      tursoQuery(SQL[_linksEntityType]),
+      _scanVaultForLinks(),
+    ]);
+    _linksEntities = entities;
+    _linksAllFiles = vaultRes.all;
+    _linksVaultMap = vaultRes.map;
+    _linksLoaded = true;
+    _renderLinksList();
+  } catch (e) {
+    document.getElementById('links-status').textContent = `Error: ${e.message}`;
+    document.getElementById('links-list').innerHTML = '';
+  }
+}
+
+function _renderLinksList() {
+  const q = _linksSearchQuery.trim().toLowerCase();
+  let entities = _linksEntities;
+  if (q) entities = entities.filter(e => (e.name || '').toLowerCase().includes(q));
+
+  const linkedCount   = entities.filter(e => _linksVaultMap[String(e.id)]).length;
+  const unlinkedCount = entities.length - linkedCount;
+  document.getElementById('links-status').textContent =
+    `${linkedCount} linked · ${unlinkedCount} unlinked · ${entities.length} total`;
+
+  if (entities.length === 0) {
+    document.getElementById('links-list').innerHTML = '<div class="vault-placeholder">No entries found.</div>';
+    return;
+  }
+
+  document.getElementById('links-list').innerHTML = entities.map(e => {
+    const idStr  = String(e.id);
+    const linked = _linksVaultMap[idStr];
+    const sub    = e.pronunciation
+      ? `<span class="links-sub">${escapeHtml(e.pronunciation)}</span>`
+      : e.teaser
+        ? `<span class="links-sub">${escapeHtml(e.teaser.slice(0, 70))}${e.teaser.length > 70 ? '…' : ''}</span>`
+        : '';
+
+    if (linked) {
+      return `<div class="links-row" data-id="${idStr}">
+        <div class="links-indicator links-ind-on" title="Linked"></div>
+        <div class="links-row-body">
+          <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
+          <div class="links-row-path">${escapeHtml(linked.relPath)}</div>
+        </div>
+        <div class="links-row-btns">
+          <button class="btn btn-ghost btn-xs links-open-btn" data-path="${escapeHtml(linked.path)}">Open</button>
+          <button class="btn btn-ghost btn-xs links-unlink-btn" data-id="${idStr}" data-path="${escapeHtml(linked.path)}">Unlink</button>
+        </div>
+      </div>`;
+    } else {
+      return `<div class="links-row links-row-dim" data-id="${idStr}">
+        <div class="links-indicator links-ind-off" title="Unlinked"></div>
+        <div class="links-row-body">
+          <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
+        </div>
+        <div class="links-row-btns">
+          <button class="btn btn-ghost btn-xs links-link-btn" data-id="${idStr}" data-name="${escapeHtml(e.name || '')}">Link</button>
+        </div>
+      </div>`;
+    }
+  }).join('');
+}
+
+// ── Link / unlink actions ─────────────────────────────────────────────────
+
+async function _doLink(id, filePath) {
+  try {
+    const content = await invoke('read_text_file', { path: filePath });
+    await invoke('write_text_file', { path: filePath, content: _fmSetField(content, 'rpgmanager_id', id) });
+    const name = filePath.split('/').pop().replace(/\.md$/, '');
+    _linksVaultMap[String(id)] = { name, path: filePath, relPath: filePath.slice(VAULT_PATH.length + 1) };
+    _renderLinksList();
+    showToast('Linked!', 'success');
+  } catch (e) {
+    showToast(`Link failed: ${e.message}`);
+  }
+}
+
+async function _doUnlink(id, filePath) {
+  try {
+    const content = await invoke('read_text_file', { path: filePath });
+    await invoke('write_text_file', { path: filePath, content: _fmRemoveField(content, 'rpgmanager_id') });
+    delete _linksVaultMap[String(id)];
+    _renderLinksList();
+    showToast('Unlinked', 'success');
+  } catch (e) {
+    showToast(`Unlink failed: ${e.message}`);
+  }
+}
+
+// ── File picker modal ─────────────────────────────────────────────────────
+
+function _openLinkPicker(id, entityName) {
+  return new Promise(resolve => {
+    const modal  = document.getElementById('links-pick-modal');
+    const title  = document.getElementById('links-pick-title');
+    const search = document.getElementById('links-pick-search');
+    const list   = document.getElementById('links-pick-list');
+    const cancel = document.getElementById('links-pick-cancel');
+
+    title.textContent = `Link "${entityName}" to Vault File`;
+    search.value = entityName;
+    modal.style.display = 'flex';
+
+    function renderPicker(query) {
+      const q = query.trim().toLowerCase();
+      const files = (q
+        ? _linksAllFiles.filter(f => f.name.toLowerCase().includes(q) || f.relPath.toLowerCase().includes(q))
+        : _linksAllFiles
+      ).slice(0, 80);
+
+      list.innerHTML = files.length
+        ? files.map(f => {
+            const folder = f.relPath.split('/').slice(0, -1).join(' / ');
+            return `<div class="links-pick-item" data-path="${escapeHtml(f.path)}">
+              <div class="links-pick-name">${escapeHtml(f.name)}</div>
+              ${folder ? `<div class="links-pick-folder">${escapeHtml(folder)}</div>` : ''}
+            </div>`;
+          }).join('')
+        : '<div class="vault-placeholder">No files match.</div>';
+    }
+
+    renderPicker(entityName);
+    requestAnimationFrame(() => { search.focus(); search.select(); });
+
+    let st = null;
+    const onInput = () => { clearTimeout(st); st = setTimeout(() => renderPicker(search.value), 150); };
+    const onPick  = async e => {
+      const item = e.target.closest('.links-pick-item');
+      if (!item) return;
+      cleanup(); resolve(item.dataset.path);
+      await _doLink(id, item.dataset.path);
+    };
+    const onCancel = () => { cleanup(); resolve(null); };
+
+    function cleanup() {
+      modal.style.display = 'none';
+      search.removeEventListener('input', onInput);
+      list.removeEventListener('click', onPick);
+      cancel.removeEventListener('click', onCancel);
+    }
+
+    search.addEventListener('input', onInput);
+    list.addEventListener('click', onPick);
+    cancel.addEventListener('click', onCancel);
+  });
+}
+
+// ── Event delegation for links list ──────────────────────────────────────
+
+document.getElementById('links-list').addEventListener('click', async e => {
+  const openBtn   = e.target.closest('.links-open-btn');
+  const unlinkBtn = e.target.closest('.links-unlink-btn');
+  const linkBtn   = e.target.closest('.links-link-btn');
+
+  if (openBtn) {
+    const url = buildObsidianUrl(openBtn.dataset.path);
+    if (url) invoke('open_file', { path: url });
+  } else if (unlinkBtn) {
+    await _doUnlink(unlinkBtn.dataset.id, unlinkBtn.dataset.path);
+  } else if (linkBtn) {
+    await _openLinkPicker(linkBtn.dataset.id, linkBtn.dataset.name);
+  }
+});
+
+document.getElementById('links-type-select').addEventListener('change', e => {
+  _linksEntityType = e.target.value;
+  _linksLoaded = false;
+  loadLinksTab();
+});
+
+document.getElementById('links-refresh-btn').addEventListener('click', () => {
+  _linksLoaded = false;
+  loadLinksTab(true);
+});
+
+document.getElementById('links-search').addEventListener('input', e => {
+  _linksSearchQuery = e.target.value;
+  clearTimeout(_linksSearchTimeout);
+  _linksSearchTimeout = setTimeout(_renderLinksList, 200);
 });
