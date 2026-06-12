@@ -1856,10 +1856,15 @@ details[open] .recap-summary::before { transform: rotate(90deg); }
   align-items: center;
   gap: 10px;
   padding: 7px 8px;
-  border-radius: var(--radius);
+  border-radius: var(--radius) var(--radius) 0 0;
   border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: background 0.1s;
 }
-.links-row:last-child { border-bottom: none; }
+.links-row:hover { background: var(--bg-surface); }
+.links-row-alt { background: rgba(255,255,255,0.025); }
+.links-row-alt:hover { background: var(--bg-surface); }
+.links-row-expanded { border-bottom: none; }
 .links-row-dim { opacity: 0.65; }
 
 .links-indicator {
@@ -1907,6 +1912,77 @@ details[open] .recap-summary::before { transform: rotate(90deg); }
 .btn-xs {
   padding: 3px 8px;
   font-size: 12px;
+}
+
+/* ── Detail expansion panel ──────────────────────────────────────────── */
+
+.links-detail {
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+}
+.links-detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  min-height: 120px;
+  max-height: 340px;
+}
+.links-detail-col {
+  overflow-y: auto;
+  padding: 12px 14px;
+  scrollbar-width: thin;
+}
+.links-detail-col + .links-detail-col {
+  border-left: 1px solid var(--border-subtle);
+}
+.links-detail-col::-webkit-scrollbar { width: 3px; }
+.links-detail-col::-webkit-scrollbar-thumb { background: var(--border-accent); border-radius: 2px; }
+
+.links-detail-head {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+
+.links-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.links-field-key {
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.links-field-val {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.links-vault-content {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+.links-vault-content h1, .links-vault-content h2, .links-vault-content h3 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 10px 0 4px;
+}
+.links-vault-content p { margin: 0 0 6px; }
+.links-vault-content ul, .links-vault-content ol { padding-left: 16px; margin: 0 0 6px; }
+
+.links-unlinked-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-style: italic;
 }
 
 /* ── Link file picker modal ──────────────────────────────────────────── */

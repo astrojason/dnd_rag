@@ -1959,11 +1959,13 @@ document.getElementById('vault-search-input').addEventListener('input', e => {
 
 let _linksEntityType = 'npcs';
 let _linksEntities = [];
-let _linksVaultMap = {};   // rpgmanager_id (string) -> {name, path, relPath}
-let _linksAllFiles = [];   // all vault .md files (for the picker)
+let _linksVaultMap = {};          // rpgmanager_id (string) -> {name, path, relPath}
+let _linksAllFiles = [];          // all vault .md files (for the picker)
 let _linksLoaded = false;
 let _linksSearchQuery = '';
 let _linksSearchTimeout = null;
+let _linksExpandedId = null;      // id of currently expanded row
+let _linksVaultContentCache = {}; // id -> rendered HTML string
 
 // ── Frontmatter helpers ──────────────────────────────────────────────────
 
@@ -2038,8 +2040,8 @@ async function loadLinksTab(force = false) {
 
   try {
     const SQL = {
-      npcs:      'SELECT id, name, pronunciation, race, gender, status FROM npcs ORDER BY name',
-      locations: 'SELECT id, name, pronunciation, teaser FROM locations ORDER BY name',
+      npcs:      'SELECT id, name, pronunciation, race, gender, status, description FROM npcs ORDER BY name',
+      locations: 'SELECT id, name, pronunciation, teaser, detail FROM locations ORDER BY name',
     };
     const [entities, vaultRes] = await Promise.all([
       tursoQuery(SQL[_linksEntityType]),
@@ -2071,39 +2073,99 @@ function _renderLinksList() {
     return;
   }
 
-  document.getElementById('links-list').innerHTML = entities.map(e => {
-    const idStr  = String(e.id);
-    const linked = _linksVaultMap[idStr];
-    const sub    = e.pronunciation
+  document.getElementById('links-list').innerHTML = entities.map((e, idx) => {
+    const idStr     = String(e.id);
+    const linked    = _linksVaultMap[idStr];
+    const expanded  = _linksExpandedId === idStr;
+    const zebraClass = idx % 2 === 1 ? ' links-row-alt' : '';
+    const expandedClass = expanded ? ' links-row-expanded' : '';
+    const sub = e.pronunciation
       ? `<span class="links-sub">${escapeHtml(e.pronunciation)}</span>`
       : e.teaser
         ? `<span class="links-sub">${escapeHtml(e.teaser.slice(0, 70))}${e.teaser.length > 70 ? '…' : ''}</span>`
         : '';
 
-    if (linked) {
-      return `<div class="links-row" data-id="${idStr}">
-        <div class="links-indicator links-ind-on" title="Linked"></div>
-        <div class="links-row-body">
-          <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
-          <div class="links-row-path">${escapeHtml(linked.relPath)}</div>
+    const rowHtml = linked
+      ? `<div class="links-row${zebraClass}${expandedClass}" data-id="${idStr}">
+          <div class="links-indicator links-ind-on" title="Linked"></div>
+          <div class="links-row-body">
+            <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
+            <div class="links-row-path">${escapeHtml(linked.relPath)}</div>
+          </div>
+          <div class="links-row-btns">
+            <button class="btn btn-ghost btn-xs links-open-btn" data-path="${escapeHtml(linked.path)}">Open</button>
+            <button class="btn btn-ghost btn-xs links-unlink-btn" data-id="${idStr}" data-path="${escapeHtml(linked.path)}">Unlink</button>
+          </div>
+        </div>`
+      : `<div class="links-row links-row-dim${zebraClass}${expandedClass}" data-id="${idStr}">
+          <div class="links-indicator links-ind-off" title="Unlinked"></div>
+          <div class="links-row-body">
+            <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
+          </div>
+          <div class="links-row-btns">
+            <button class="btn btn-ghost btn-xs links-link-btn" data-id="${idStr}" data-name="${escapeHtml(e.name || '')}">Link</button>
+          </div>
+        </div>`;
+
+    const detailHtml = expanded ? `
+      <div class="links-detail" id="links-detail-${idStr}">
+        <div class="links-detail-grid">
+          <div class="links-detail-col">
+            <div class="links-detail-head">RPGManager</div>
+            ${_renderDbFields(e)}
+          </div>
+          <div class="links-detail-col">
+            <div class="links-detail-head">Vault</div>
+            <div class="links-vault-content" id="links-vault-${idStr}">
+              ${linked ? '<span class="text-dim">Loading…</span>' : '<span class="links-unlinked-note">Not linked — click Link to connect a vault file.</span>'}
+            </div>
+          </div>
         </div>
-        <div class="links-row-btns">
-          <button class="btn btn-ghost btn-xs links-open-btn" data-path="${escapeHtml(linked.path)}">Open</button>
-          <button class="btn btn-ghost btn-xs links-unlink-btn" data-id="${idStr}" data-path="${escapeHtml(linked.path)}">Unlink</button>
-        </div>
-      </div>`;
-    } else {
-      return `<div class="links-row links-row-dim" data-id="${idStr}">
-        <div class="links-indicator links-ind-off" title="Unlinked"></div>
-        <div class="links-row-body">
-          <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
-        </div>
-        <div class="links-row-btns">
-          <button class="btn btn-ghost btn-xs links-link-btn" data-id="${idStr}" data-name="${escapeHtml(e.name || '')}">Link</button>
-        </div>
-      </div>`;
-    }
+      </div>` : '';
+
+    return rowHtml + detailHtml;
   }).join('');
+
+  // Async: load vault content for expanded row if linked
+  if (_linksExpandedId) {
+    const linked = _linksVaultMap[_linksExpandedId];
+    if (linked) _loadVaultContent(_linksExpandedId, linked.path);
+  }
+}
+
+function _renderDbFields(entity) {
+  const keys = _linksEntityType === 'npcs'
+    ? ['name', 'pronunciation', 'race', 'gender', 'status', 'description']
+    : ['name', 'pronunciation', 'teaser', 'detail'];
+  return keys
+    .filter(k => entity[k])
+    .map(k => `<div class="links-field">
+      <span class="links-field-key">${k}</span>
+      <span class="links-field-val">${escapeHtml(String(entity[k]))}</span>
+    </div>`)
+    .join('');
+}
+
+async function _loadVaultContent(id, filePath) {
+  if (_linksVaultContentCache[id]) {
+    _updateVaultEl(id, _linksVaultContentCache[id]);
+    return;
+  }
+  try {
+    const raw = await invoke('read_text_file', { path: filePath });
+    const fm  = _parseFm(raw);
+    const body = (fm ? fm.body : raw).slice(0, 4000);
+    const html = marked.parse(body);
+    _linksVaultContentCache[id] = html;
+    _updateVaultEl(id, html);
+  } catch (err) {
+    _updateVaultEl(id, `<span class="text-dim">Could not read file: ${escapeHtml(err.message)}</span>`);
+  }
+}
+
+function _updateVaultEl(id, html) {
+  const el = document.getElementById(`links-vault-${id}`);
+  if (el) el.innerHTML = html;
 }
 
 // ── Link / unlink actions ─────────────────────────────────────────────────
@@ -2205,17 +2267,28 @@ document.getElementById('links-list').addEventListener('click', async e => {
     await _doUnlink(unlinkBtn.dataset.id, unlinkBtn.dataset.path);
   } else if (linkBtn) {
     await _openLinkPicker(linkBtn.dataset.id, linkBtn.dataset.name);
+  } else {
+    const row = e.target.closest('.links-row');
+    if (row) {
+      const id = row.dataset.id;
+      _linksExpandedId = _linksExpandedId === id ? null : id;
+      _renderLinksList();
+    }
   }
 });
 
 document.getElementById('links-type-select').addEventListener('change', e => {
   _linksEntityType = e.target.value;
   _linksLoaded = false;
+  _linksExpandedId = null;
+  _linksVaultContentCache = {};
   loadLinksTab();
 });
 
 document.getElementById('links-refresh-btn').addEventListener('click', () => {
   _linksLoaded = false;
+  _linksExpandedId = null;
+  _linksVaultContentCache = {};
   loadLinksTab(true);
 });
 
