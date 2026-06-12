@@ -2540,6 +2540,33 @@ async function _createVaultDoc(suggestedName, dbId) {
   setTimeout(() => { nameInput.focus(); nameInput.select(); }, 50);
 }
 
+function _buildVaultDocContent(entity, title, dbId) {
+  const id = dbId ?? entity?.id ?? '';
+
+  if (_linksEntityType === 'npcs') {
+    const fmLines = [`rpgmanager_id: ${id}`];
+    if (entity?.pronunciation) fmLines.push(`pronunciation: ${entity.pronunciation}`);
+
+    const section = (heading, val) =>
+      `## ${heading}\n\n${val ? val.trimEnd() : ''}\n`;
+
+    return [
+      `---`,
+      ...fmLines,
+      `---`,
+      ``,
+      `# ${title}`,
+      ``,
+      section('Description',       entity?.description),
+      section('Roleplaying Notes', entity?.roleplaying_notes),
+      section('GM Notes',          entity?.gm_notes),
+    ].join('\n');
+  }
+
+  // Generic fallback for other entity types
+  return `---\nrpgmanager_id: ${id}\n---\n\n# ${title}\n\n`;
+}
+
 async function _doCreateVaultDoc() {
   const entityDir = LINKS_ENTITY_DIRS[_linksEntityType];
   if (!entityDir) return;
@@ -2553,7 +2580,8 @@ async function _doCreateVaultDoc() {
   const dirPath  = folder ? `${VAULT_PATH}/${entityDir}/${folder}` : `${VAULT_PATH}/${entityDir}`;
   const filePath = `${dirPath}/${fileName}`;
   const title    = fileName.replace(/\.md$/, '');
-  const content  = `---\n---\n\n# ${title}\n\n`;
+  const entity   = dbId ? _linksEntities.find(e => String(e.id) === String(dbId)) : null;
+  const content  = _buildVaultDocContent(entity, title, dbId);
 
   try {
     await invoke('write_text_file', { path: filePath, content });
