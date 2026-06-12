@@ -2103,11 +2103,13 @@ function _renderLinksList() {
         ? `<span class="links-sub">${escapeHtml(e.teaser.slice(0, 70))}${e.teaser.length > 70 ? '…' : ''}</span>`
         : '';
 
+    const nameMismatch = linked && (e.name || '').toLowerCase() !== linked.name.toLowerCase();
+
     const rowHtml = linked
       ? `<div class="links-row${zebraClass}${expClass}" data-id="${idStr}">
           <div class="links-indicator links-ind-on" title="Linked"></div>
           <div class="links-row-body">
-            <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
+            <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}${nameMismatch ? ' <span class="links-name-warn" title="DB name differs from vault filename">⚠ name differs</span>' : ''}</div>
             <div class="links-row-path">${escapeHtml(linked.relPath)}</div>
           </div>
           <div class="links-row-btns">
@@ -2241,6 +2243,7 @@ async function _doLink(id, filePath) {
     await invoke('write_text_file', { path: filePath, content: _fmSetField(content, 'rpgmanager_id', id) });
     const name = filePath.split('/').pop().replace(/\.md$/, '');
     _linksVaultMap[String(id)] = { name, path: filePath, relPath: filePath.slice(VAULT_PATH.length + 1) };
+    _linksVaultOnly = _linksVaultOnly.filter(f => f.path !== filePath);
     _renderLinksList();
     showToast('Linked!', 'success');
   } catch (e) {
@@ -2360,8 +2363,6 @@ async function _openDbEntityPicker(filePath, fileName) {
       if (!item) return;
       cleanup(); resolve(item.dataset.id);
       await _doLink(item.dataset.id, filePath);
-      // Move from vaultOnly to linked in state
-      _linksVaultOnly = _linksVaultOnly.filter(f => f.path !== filePath);
     };
     const onCancel = () => { cleanup(); resolve(null); };
 
