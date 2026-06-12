@@ -40,6 +40,23 @@ async function tursoQuery(sql) {
   );
 }
 
+async function tursoExecute(sql, args = []) {
+  const mapped = args.map(v =>
+    v === null || v === undefined ? { type: 'null' } :
+    typeof v === 'number'        ? { type: 'integer', value: String(v) } :
+    { type: 'text', value: String(v) }
+  );
+  const res = await fetch(`${TURSO_URL}/v2/pipeline`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${TURSO_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ requests: [{ type: 'execute', stmt: { sql, args: mapped } }, { type: 'close' }] }),
+  });
+  const data = await res.json();
+  if (data.results?.[0]?.type === 'error') throw new Error(data.results[0].error.message);
+  const result = data.results[0].response.result;
+  return { rowsAffected: result.rows_affected, lastInsertRowid: result.last_insert_rowid };
+}
+
 function buildObsidianUrl(filePath) {
   if (!filePath) return null;
   // file_path in metadata is the Mac path from ingest time — strip vault prefix
@@ -229,6 +246,7 @@ document.getElementById('app').innerHTML = `
           <option value="items">Items</option>
         </select>
         <input class="vault-search-input links-search-input" id="links-search" type="text" placeholder="Search…" autocomplete="off">
+        <button class="btn btn-ghost" id="links-new-btn">+ New</button>
         <button class="btn btn-ghost" id="links-refresh-btn">↻ Refresh</button>
       </div>
       <div class="links-status" id="links-status">—</div>
@@ -405,6 +423,47 @@ document.getElementById('app').innerHTML = `
       <div class="links-pick-list" id="links-pick-list"></div>
       <div class="modal-actions">
         <button class="btn btn-ghost" id="links-pick-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="links-entity-modal" style="display:none">
+    <div class="modal links-entity-modal-inner">
+      <div class="modal-title" id="links-entity-modal-title">New Entity</div>
+      <div class="links-entity-form" id="links-entity-form"></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="links-entity-cancel">Cancel</button>
+        <button class="btn btn-danger" id="links-entity-delete" style="display:none">Delete</button>
+        <button class="btn btn-primary" id="links-entity-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="links-create-vault-modal" style="display:none">
+    <div class="modal links-create-vault-modal-inner">
+      <div class="modal-title">Create Vault Document</div>
+      <div class="links-form-field">
+        <label class="links-form-label">Document Name</label>
+        <input type="text" class="links-form-input" id="links-create-vault-name" placeholder="e.g. Elara Moonwhisper" autocomplete="off">
+      </div>
+      <div class="links-form-field">
+        <label class="links-form-label">Folder</label>
+        <select class="tool-select" id="links-create-vault-folder" style="width:100%"></select>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="links-create-vault-cancel">Cancel</button>
+        <button class="btn btn-primary" id="links-create-vault-confirm">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="links-vault-edit-modal" style="display:none">
+    <div class="modal links-vault-edit-modal-inner">
+      <div class="modal-title" id="links-vault-edit-title">Edit Vault Document</div>
+      <textarea class="links-vault-edit-textarea" id="links-vault-edit-textarea" spellcheck="false"></textarea>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="links-vault-edit-cancel">Cancel</button>
+        <button class="btn btn-primary" id="links-vault-edit-save">Save</button>
       </div>
     </div>
   </div>
@@ -1969,6 +2028,74 @@ document.getElementById('vault-search-input').addEventListener('input', e => {
 
 // ── Links tab ────────────────────────────────────────────────────────────
 
+// ── Entity field definitions (drives both the edit form and DB display) ──
+const ENTITY_FIELDS = {
+  npcs: [
+    { key: 'name',              label: 'Name',             type: 'text',     required: true },
+    { key: 'aka',               label: 'AKA',              type: 'text' },
+    { key: 'display_name',      label: 'Display Name',     type: 'text' },
+    { key: 'pronunciation',     label: 'Pronunciation',    type: 'text' },
+    { key: 'race',              label: 'Race',             type: 'text' },
+    { key: 'gender',            label: 'Gender',           type: 'text' },
+    { key: 'location',          label: 'Location',         type: 'text' },
+    { key: 'status',            label: 'Status',           type: 'text' },
+    { key: 'description',       label: 'Description',      type: 'textarea' },
+    { key: 'background',        label: 'Background',       type: 'textarea' },
+    { key: 'roleplaying_notes', label: 'Roleplaying Notes',type: 'textarea' },
+    { key: 'gm_notes',          label: 'GM Notes',         type: 'textarea' },
+    { key: 'hidden',            label: 'Hidden',           type: 'checkbox' },
+    { key: 'nameHidden',        label: 'Name Hidden',      type: 'checkbox' },
+  ],
+  locations: [
+    { key: 'name',          label: 'Name',          type: 'text',     required: true },
+    { key: 'pronunciation', label: 'Pronunciation', type: 'text' },
+    { key: 'teaser',        label: 'Teaser',        type: 'textarea' },
+    { key: 'detail',        label: 'Detail',        type: 'textarea' },
+    { key: 'gm_notes',      label: 'GM Notes',      type: 'textarea' },
+  ],
+  factions: [
+    { key: 'name',          label: 'Name',          type: 'text',     required: true },
+    { key: 'pronunciation', label: 'Pronunciation', type: 'text' },
+    { key: 'type',          label: 'Type',          type: 'text' },
+    { key: 'status',        label: 'Status',        type: 'text' },
+    { key: 'location',      label: 'Location',      type: 'text' },
+    { key: 'description',   label: 'Description',   type: 'textarea' },
+    { key: 'goals',         label: 'Goals',         type: 'textarea' },
+    { key: 'background',    label: 'Background',    type: 'textarea' },
+    { key: 'gm_notes',      label: 'GM Notes',      type: 'textarea' },
+  ],
+  deities: [
+    { key: 'name',          label: 'Name',          type: 'text',     required: true },
+    { key: 'pronunciation', label: 'Pronunciation', type: 'text' },
+    { key: 'domain',        label: 'Domain',        type: 'text' },
+    { key: 'alignment',     label: 'Alignment',     type: 'text' },
+    { key: 'status',        label: 'Status',        type: 'text' },
+    { key: 'description',   label: 'Description',   type: 'textarea' },
+    { key: 'symbol',        label: 'Symbol',        type: 'text' },
+    { key: 'church',        label: 'Church',        type: 'textarea' },
+    { key: 'tenets',        label: 'Tenets',        type: 'textarea' },
+    { key: 'lore',          label: 'Lore',          type: 'textarea' },
+    { key: 'gm_notes',      label: 'GM Notes',      type: 'textarea' },
+  ],
+  items: [
+    { key: 'name',        label: 'Name',         type: 'text',     required: true },
+    { key: 'category',    label: 'Category',     type: 'text' },
+    { key: 'pronunciation',label: 'Pronunciation',type: 'text' },
+    { key: 'type_tag',    label: 'Type Tag',     type: 'text' },
+    { key: 'description', label: 'Description',  type: 'textarea' },
+    { key: 'properties',  label: 'Properties',   type: 'textarea' },
+    { key: 'gm_notes',    label: 'GM Notes',     type: 'textarea' },
+  ],
+};
+
+const ENTITY_SCHEMA = {
+  npcs:      { table: 'npcs',      fields: ['name','aka','display_name','pronunciation','race','gender','location','status','description','background','roleplaying_notes','gm_notes','hidden','nameHidden'] },
+  locations: { table: 'locations', fields: ['name','pronunciation','teaser','detail','gm_notes'] },
+  factions:  { table: 'factions',  fields: ['name','pronunciation','type','status','location','description','goals','background','gm_notes'] },
+  deities:   { table: 'deities',   fields: ['name','pronunciation','domain','alignment','status','description','symbol','church','tenets','lore','gm_notes'] },
+  items:     { table: 'items',     fields: ['name','category','pronunciation','type_tag','description','properties','gm_notes'] },
+};
+
 let _linksEntityType = 'npcs';
 let _linksEntities = [];
 let _linksVaultMap = {};          // rpgmanager_id (string) -> {name, path, relPath}
@@ -2123,6 +2250,7 @@ function _renderLinksList() {
           </div>
           <div class="links-row-btns">
             <button class="btn btn-ghost btn-xs links-open-btn" data-path="${escapeHtml(linked.path)}">Open</button>
+            <button class="btn btn-ghost btn-xs links-edit-db-btn" data-id="${idStr}">Edit</button>
             <button class="btn btn-ghost btn-xs links-unlink-btn" data-id="${idStr}" data-path="${escapeHtml(linked.path)}">Unlink</button>
           </div>
         </div>`
@@ -2132,6 +2260,7 @@ function _renderLinksList() {
             <div class="links-row-name">${escapeHtml(e.name || '—')} ${sub}</div>
           </div>
           <div class="links-row-btns">
+            <button class="btn btn-ghost btn-xs links-edit-db-btn" data-id="${idStr}">Edit</button>
             <button class="btn btn-ghost btn-xs links-link-btn" data-id="${idStr}" data-name="${escapeHtml(e.name || '')}">Link</button>
           </div>
         </div>`;
@@ -2144,7 +2273,11 @@ function _renderLinksList() {
             ${_renderDbFields(e)}
           </div>
           <div class="links-detail-col">
-            <div class="links-detail-head">Vault</div>
+            <div class="links-detail-head">Vault
+              ${linked
+                ? `<button class="btn btn-ghost btn-xs links-edit-vault-btn" data-path="${escapeHtml(linked.path)}" style="margin-left:8px">Edit Vault</button>`
+                : `<button class="btn btn-ghost btn-xs links-create-vault-btn" data-id="${idStr}" data-name="${escapeHtml(e.name || '')}" style="margin-left:8px">Create Vault Doc</button>`}
+            </div>
             ${linked ? `<div class="links-vault-title">${escapeHtml(linked.name)}</div>` : ''}
             <div class="links-vault-content" id="links-vault-db-${idStr}">
               ${linked ? '<span class="text-dim">Loading…</span>' : '<span class="links-unlinked-note">Not linked — click Link to connect a vault file.</span>'}
@@ -2174,7 +2307,10 @@ function _renderLinksList() {
       </div>
       <div class="links-row-btns">
         <button class="btn btn-ghost btn-xs links-open-btn" data-path="${safePath}">Open</button>
+        <button class="btn btn-ghost btn-xs links-edit-vault-btn" data-path="${safePath}">Edit</button>
+        <button class="btn btn-ghost btn-xs links-create-in-db-btn" data-path="${safePath}" data-name="${escapeHtml(f.name)}">Create in DB</button>
         <button class="btn btn-ghost btn-xs links-vault-link-btn" data-path="${safePath}" data-name="${escapeHtml(f.name)}">Link to DB</button>
+        <button class="btn btn-ghost btn-xs links-delete-vault-btn" data-path="${safePath}" data-name="${escapeHtml(f.name)}">Delete</button>
       </div>
     </div>`;
 
@@ -2212,21 +2348,240 @@ function _renderLinksList() {
 }
 
 function _renderDbFields(entity) {
-  const KEYS = {
-    npcs:      ['name', 'pronunciation', 'race', 'gender', 'status', 'description'],
-    locations: ['name', 'pronunciation', 'teaser', 'detail'],
-    factions:  ['name', 'pronunciation', 'type', 'status', 'location', 'description', 'goals', 'background'],
-    deities:   ['name', 'pronunciation', 'domain', 'alignment', 'status', 'description', 'symbol', 'church', 'tenets', 'lore'],
-    items:     ['name', 'category', 'pronunciation', 'type_tag', 'description', 'properties'],
-  };
-  const keys = KEYS[_linksEntityType] || ['name', 'description'];
-  return keys
-    .filter(k => entity[k])
-    .map(k => `<div class="links-field">
-      <span class="links-field-key">${k}</span>
-      <span class="links-field-val">${escapeHtml(String(entity[k]))}</span>
-    </div>`)
+  const fields = ENTITY_FIELDS[_linksEntityType] || [];
+  return fields
+    .filter(f => f.type !== 'checkbox' && entity[f.key])
+    .map(f => {
+      const val = String(entity[f.key]);
+      const isMarkdown = f.type === 'textarea';
+      return `<div class="links-field">
+        <span class="links-field-key">${escapeHtml(f.label)}</span>
+        <div class="links-field-val${isMarkdown ? ' links-field-md' : ''}">${isMarkdown ? marked.parse(val) : escapeHtml(val)}</div>
+      </div>`;
+    })
     .join('');
+}
+
+// ── Entity CRUD ───────────────────────────────────────────────────────────
+
+let _entityEditId        = null; // null = create new, string = editing existing id
+let _entityEditVaultPath = null; // vault file to auto-link after INSERT
+
+async function _openCreateInDb(filePath, fileName) {
+  _entityEditVaultPath = filePath;
+  const prefill = { name: fileName };
+  try {
+    const raw = await invoke('read_text_file', { path: filePath });
+    for (const f of ENTITY_FIELDS[_linksEntityType] || []) {
+      const v = _fmGetField(raw, f.key);
+      if (v) prefill[f.key] = v;
+    }
+  } catch (_) {}
+  _openEntityEdit(prefill);
+}
+
+function _openEntityEdit(entity) {
+  _entityEditId = entity ? String(entity.id) : null;
+  const type = _linksEntityType;
+  const typeSingular = { npcs: 'NPC', locations: 'Location', factions: 'Faction', deities: 'Deity', items: 'Item' }[type] || type;
+  document.getElementById('links-entity-modal-title').textContent =
+    entity ? `Edit ${typeSingular} — ${entity.name || ''}` : `New ${typeSingular}`;
+  document.getElementById('links-entity-delete').style.display = entity ? 'inline-flex' : 'none';
+  document.getElementById('links-entity-form').innerHTML = _renderEntityForm(entity);
+  document.getElementById('links-entity-modal').style.display = 'flex';
+}
+
+function _renderEntityForm(entity) {
+  const fields = ENTITY_FIELDS[_linksEntityType] || [];
+  return fields.map(f => {
+    const val = entity ? (entity[f.key] ?? '') : '';
+    if (f.type === 'checkbox') {
+      const checked = (val === 1 || val === true || val === '1') ? 'checked' : '';
+      return `<label class="links-form-check"><input type="checkbox" name="${f.key}" ${checked}> ${escapeHtml(f.label)}</label>`;
+    } else if (f.type === 'textarea') {
+      return `<div class="links-form-field">
+        <label class="links-form-label">${escapeHtml(f.label)}</label>
+        <textarea class="links-form-textarea" name="${f.key}" rows="3">${escapeHtml(String(val || ''))}</textarea>
+      </div>`;
+    } else {
+      return `<div class="links-form-field">
+        <label class="links-form-label">${escapeHtml(f.label)}${f.required ? ' *' : ''}</label>
+        <input type="text" class="links-form-input" name="${f.key}" value="${escapeHtml(String(val || ''))}">
+      </div>`;
+    }
+  }).join('');
+}
+
+async function _saveEntity() {
+  const schema = ENTITY_SCHEMA[_linksEntityType];
+  if (!schema) return;
+  const form = document.getElementById('links-entity-form');
+  const data = {};
+  for (const f of ENTITY_FIELDS[_linksEntityType] || []) {
+    if (f.type === 'checkbox') {
+      data[f.key] = form.querySelector(`[name="${f.key}"]`)?.checked ? 1 : 0;
+    } else {
+      const v = form.querySelector(`[name="${f.key}"]`)?.value?.trim();
+      data[f.key] = v || null;
+    }
+  }
+  if (!data.name) { showToast('Name is required'); return; }
+
+  const saveBtn = document.getElementById('links-entity-save');
+  saveBtn.disabled = true;
+  try {
+    if (_entityEditId === null) {
+      const placeholders = schema.fields.map(() => '?').join(',');
+      const args = schema.fields.map(k => data[k] ?? null);
+      const res = await tursoExecute(
+        `INSERT INTO ${schema.table} (${schema.fields.join(',')}) VALUES (${placeholders})`,
+        args
+      );
+      data.id = res.lastInsertRowid;
+      _linksEntities.push(data);
+      _linksEntities.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      if (_entityEditVaultPath) {
+        await _doLink(data.id, _entityEditVaultPath);
+        _entityEditVaultPath = null;
+      }
+    } else {
+      const setClause = schema.fields.map(k => `${k}=?`).join(',');
+      const args = [...schema.fields.map(k => data[k] ?? null), _entityEditId];
+      await tursoExecute(`UPDATE ${schema.table} SET ${setClause} WHERE id=?`, args);
+      const idx = _linksEntities.findIndex(e => String(e.id) === _entityEditId);
+      if (idx >= 0) _linksEntities[idx] = { ..._linksEntities[idx], ...data };
+    }
+    document.getElementById('links-entity-modal').style.display = 'none';
+    _renderLinksList();
+    showToast(_entityEditId === null ? 'Created!' : 'Saved!', 'success');
+  } catch (err) {
+    showToast(`Save failed: ${err.message}`);
+  } finally {
+    saveBtn.disabled = false;
+  }
+}
+
+async function _deleteEntity(id) {
+  const schema = ENTITY_SCHEMA[_linksEntityType];
+  if (!schema) return;
+  const entity = _linksEntities.find(e => String(e.id) === String(id));
+  if (!confirm(`Delete "${entity?.name || id}"? This cannot be undone.`)) return;
+  try {
+    await tursoExecute(`DELETE FROM ${schema.table} WHERE id=?`, [id]);
+    _linksEntities = _linksEntities.filter(e => String(e.id) !== String(id));
+    delete _linksVaultMap[String(id)];
+    _linksExpandedId = null;
+    document.getElementById('links-entity-modal').style.display = 'none';
+    _renderLinksList();
+    showToast('Deleted', 'success');
+  } catch (err) {
+    showToast(`Delete failed: ${err.message}`);
+  }
+}
+
+// ── Vault doc CRUD ────────────────────────────────────────────────────────
+
+let _vaultEditPath = null;
+
+async function _openVaultEdit(filePath) {
+  _vaultEditPath = filePath;
+  const fileName = filePath.split('/').pop();
+  document.getElementById('links-vault-edit-title').textContent = `Edit — ${fileName}`;
+  const ta = document.getElementById('links-vault-edit-textarea');
+  ta.value = '';
+  document.getElementById('links-vault-edit-save').disabled = true;
+  document.getElementById('links-vault-edit-modal').style.display = 'flex';
+  try {
+    ta.value = await invoke('read_text_file', { path: filePath });
+    document.getElementById('links-vault-edit-save').disabled = false;
+  } catch (err) {
+    showToast(`Could not read file: ${err.message}`);
+    document.getElementById('links-vault-edit-modal').style.display = 'none';
+  }
+}
+
+async function _saveVaultContent() {
+  if (!_vaultEditPath) return;
+  const content = document.getElementById('links-vault-edit-textarea').value;
+  try {
+    await invoke('write_text_file', { path: _vaultEditPath, content });
+    _linksVaultContentCache = {};
+    document.getElementById('links-vault-edit-modal').style.display = 'none';
+    _renderLinksList();
+    showToast('Saved!', 'success');
+  } catch (err) {
+    showToast(`Save failed: ${err.message}`);
+  }
+}
+
+async function _createVaultDoc(suggestedName, dbId) {
+  const entityDir = LINKS_ENTITY_DIRS[_linksEntityType];
+  if (!entityDir) return;
+
+  const entityPath = `${VAULT_PATH}/${entityDir}`;
+  let subdirs = [];
+  try {
+    const entries = await invoke('read_dir', { path: entityPath });
+    subdirs = entries
+      .filter(e => e.is_dir && !e.name.startsWith('.'))
+      .map(e => e.name)
+      .sort();
+  } catch (_) { /* entity dir may have no subdirs */ }
+
+  const select = document.getElementById('links-create-vault-folder');
+  select.innerHTML =
+    `<option value="">— ${entityDir.split('/').pop()} (root) —</option>` +
+    subdirs.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('');
+
+  const nameInput = document.getElementById('links-create-vault-name');
+  nameInput.value = suggestedName || '';
+  document.getElementById('links-create-vault-modal').dataset.dbId = dbId || '';
+  document.getElementById('links-create-vault-modal').style.display = 'flex';
+  setTimeout(() => { nameInput.focus(); nameInput.select(); }, 50);
+}
+
+async function _doCreateVaultDoc() {
+  const entityDir = LINKS_ENTITY_DIRS[_linksEntityType];
+  if (!entityDir) return;
+  const modal    = document.getElementById('links-create-vault-modal');
+  const dbId     = modal.dataset.dbId || null;
+  const folder   = document.getElementById('links-create-vault-folder').value;
+  let   fileName = document.getElementById('links-create-vault-name').value.trim();
+  if (!fileName) { showToast('Document name is required'); return; }
+  if (!fileName.endsWith('.md')) fileName += '.md';
+
+  const dirPath  = folder ? `${VAULT_PATH}/${entityDir}/${folder}` : `${VAULT_PATH}/${entityDir}`;
+  const filePath = `${dirPath}/${fileName}`;
+  const title    = fileName.replace(/\.md$/, '');
+  const content  = `---\n---\n\n# ${title}\n\n`;
+
+  try {
+    await invoke('write_text_file', { path: filePath, content });
+    modal.style.display = 'none';
+    if (dbId) await _doLink(dbId, filePath);
+    _linksLoaded = false;
+    await loadLinksTab(true);
+    await _openVaultEdit(filePath);
+  } catch (err) {
+    showToast(`Create failed: ${err.message}`);
+  }
+}
+
+async function _deleteVaultDoc(filePath, fileName) {
+  if (!confirm(`Delete "${fileName}"? This cannot be undone.`)) return;
+  try {
+    await invoke('delete_file', { path: filePath });
+    _linksVaultOnly = _linksVaultOnly.filter(f => f.path !== filePath);
+    for (const [id, info] of Object.entries(_linksVaultMap)) {
+      if (info.path === filePath) { delete _linksVaultMap[id]; break; }
+    }
+    _linksExpandedVaultPath = null;
+    _linksVaultContentCache = {};
+    _renderLinksList();
+    showToast('Deleted', 'success');
+  } catch (err) {
+    showToast(`Delete failed: ${err.message}`);
+  }
 }
 
 async function _loadVaultContent(key, filePath) {
@@ -2235,15 +2590,29 @@ async function _loadVaultContent(key, filePath) {
     return;
   }
   try {
-    const raw  = await invoke('read_text_file', { path: filePath });
-    const fm   = _parseFm(raw);
-    const body = (fm ? fm.body : raw).slice(0, 4000);
-    const html = marked.parse(body);
+    const raw    = await invoke('read_text_file', { path: filePath });
+    const fm     = _parseFm(raw);
+    const fmHtml = fm ? _renderFrontmatter(fm.front) : '';
+    const body   = (fm ? fm.body : raw).slice(0, 4000);
+    const html   = fmHtml + marked.parse(body);
     _linksVaultContentCache[key] = html;
     _updateVaultEl(key, html);
   } catch (err) {
     _updateVaultEl(key, `<span class="text-dim">Could not read file: ${escapeHtml(err.message)}</span>`);
   }
+}
+
+function _renderFrontmatter(front) {
+  const lines = front.trim().split('\n').filter(l => l.trim());
+  if (!lines.length) return '';
+  const rows = lines.map(l => {
+    const colon = l.indexOf(':');
+    if (colon < 0) return `<div class="fm-row"><span class="fm-line">${escapeHtml(l)}</span></div>`;
+    const k = l.slice(0, colon).trim();
+    const v = l.slice(colon + 1).trim();
+    return `<div class="fm-row"><span class="fm-key">${escapeHtml(k)}</span><span class="fm-val">${escapeHtml(v)}</span></div>`;
+  }).join('');
+  return `<div class="links-frontmatter">${rows}</div>`;
 }
 
 function _updateVaultEl(key, html) {
@@ -2398,10 +2767,15 @@ async function _openDbEntityPicker(filePath, fileName) {
 // ── Event delegation for links list ──────────────────────────────────────
 
 document.getElementById('links-list').addEventListener('click', async e => {
-  const openBtn      = e.target.closest('.links-open-btn');
-  const unlinkBtn    = e.target.closest('.links-unlink-btn');
-  const linkBtn      = e.target.closest('.links-link-btn');
-  const vaultLinkBtn = e.target.closest('.links-vault-link-btn');
+  const openBtn        = e.target.closest('.links-open-btn');
+  const unlinkBtn      = e.target.closest('.links-unlink-btn');
+  const linkBtn        = e.target.closest('.links-link-btn');
+  const vaultLinkBtn   = e.target.closest('.links-vault-link-btn');
+  const editDbBtn      = e.target.closest('.links-edit-db-btn');
+  const editVaultBtn   = e.target.closest('.links-edit-vault-btn');
+  const createVaultBtn = e.target.closest('.links-create-vault-btn');
+  const deleteVaultBtn = e.target.closest('.links-delete-vault-btn');
+  const createInDbBtn  = e.target.closest('.links-create-in-db-btn');
 
   if (openBtn) {
     const url = buildObsidianUrl(openBtn.dataset.path);
@@ -2412,6 +2786,22 @@ document.getElementById('links-list').addEventListener('click', async e => {
     await _openLinkPicker(linkBtn.dataset.id, linkBtn.dataset.name);
   } else if (vaultLinkBtn) {
     await _openDbEntityPicker(vaultLinkBtn.dataset.path, vaultLinkBtn.dataset.name);
+  } else if (editDbBtn) {
+    e.stopPropagation();
+    const entity = _linksEntities.find(en => String(en.id) === editDbBtn.dataset.id);
+    _openEntityEdit(entity || null);
+  } else if (editVaultBtn) {
+    e.stopPropagation();
+    await _openVaultEdit(editVaultBtn.dataset.path);
+  } else if (createVaultBtn) {
+    e.stopPropagation();
+    await _createVaultDoc(createVaultBtn.dataset.name, createVaultBtn.dataset.id);
+  } else if (deleteVaultBtn) {
+    e.stopPropagation();
+    await _deleteVaultDoc(deleteVaultBtn.dataset.path, deleteVaultBtn.dataset.name);
+  } else if (createInDbBtn) {
+    e.stopPropagation();
+    await _openCreateInDb(createInDbBtn.dataset.path, createInDbBtn.dataset.name);
   } else {
     const row = e.target.closest('.links-row');
     if (row) {
@@ -2428,6 +2818,28 @@ document.getElementById('links-list').addEventListener('click', async e => {
     }
   }
 });
+
+document.getElementById('links-new-btn').addEventListener('click', () => _openEntityEdit(null));
+
+document.getElementById('links-entity-cancel').addEventListener('click', () => {
+  document.getElementById('links-entity-modal').style.display = 'none';
+  _entityEditVaultPath = null;
+});
+document.getElementById('links-entity-save').addEventListener('click', _saveEntity);
+document.getElementById('links-entity-delete').addEventListener('click', () => _deleteEntity(_entityEditId));
+
+document.getElementById('links-create-vault-cancel').addEventListener('click', () => {
+  document.getElementById('links-create-vault-modal').style.display = 'none';
+});
+document.getElementById('links-create-vault-confirm').addEventListener('click', _doCreateVaultDoc);
+document.getElementById('links-create-vault-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter') _doCreateVaultDoc();
+});
+
+document.getElementById('links-vault-edit-cancel').addEventListener('click', () => {
+  document.getElementById('links-vault-edit-modal').style.display = 'none';
+});
+document.getElementById('links-vault-edit-save').addEventListener('click', _saveVaultContent);
 
 document.getElementById('links-type-select').addEventListener('change', e => {
   _linksEntityType = e.target.value;

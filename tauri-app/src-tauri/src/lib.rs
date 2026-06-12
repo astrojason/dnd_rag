@@ -48,6 +48,11 @@ fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(result)
 }
 
+#[tauri::command]
+fn delete_file(path: String) -> Result<(), String> {
+    std::fs::remove_file(&path).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -55,7 +60,8 @@ pub fn run() {
             open_file,
             read_text_file,
             write_text_file,
-            read_dir
+            read_dir,
+            delete_file
         ])
         .setup(|_app| Ok(()))
         .run(tauri::generate_context!())

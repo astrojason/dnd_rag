@@ -1999,6 +1999,44 @@ details[open] .recap-summary::before { transform: rotate(90deg); }
   margin-bottom: 10px;
 }
 
+.links-frontmatter {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  margin-bottom: 12px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px;
+}
+.fm-row {
+  display: flex;
+  gap: 10px;
+  line-height: 1.7;
+}
+.fm-key {
+  color: var(--gold-mid);
+  min-width: 90px;
+  flex-shrink: 0;
+}
+.fm-val {
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+.fm-line { color: var(--text-dim); }
+
+.links-field-md {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.links-field-md p { margin: 0 0 5px; }
+.links-field-md p:last-child { margin-bottom: 0; }
+.links-field-md ul, .links-field-md ol { padding-left: 16px; margin: 0 0 5px; }
+.links-field-md h1, .links-field-md h2, .links-field-md h3 {
+  font-size: 13px; font-weight: 600; color: var(--text-primary); margin: 6px 0 3px;
+}
+.links-field-md strong { color: var(--text-primary); }
+
 .links-vault-content {
   font-size: 13px;
   color: var(--text-secondary);
@@ -2058,3 +2096,115 @@ details[open] .recap-summary::before { transform: rotate(90deg); }
   font-size: 11px;
   color: var(--text-dim);
 }
+
+/* ── Entity edit modal ───────────────────────────────────────────────── */
+
+.btn-danger {
+  background: rgba(180, 40, 40, 0.15);
+  color: #e06060;
+  border: 1px solid rgba(180, 40, 40, 0.35);
+}
+.btn-danger:hover {
+  background: rgba(180, 40, 40, 0.28);
+  color: #f08080;
+}
+
+.links-entity-modal-inner {
+  width: 560px;
+  max-width: 94vw;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: 82vh;
+}
+.links-entity-form {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 2px 8px;
+  scrollbar-width: thin;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.links-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.links-form-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.links-form-input {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-body);
+  padding: 6px 9px;
+  outline: none;
+  width: 100%;
+}
+.links-form-input:focus { border-color: var(--gold-mid); }
+.links-form-textarea {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-body);
+  padding: 6px 9px;
+  outline: none;
+  width: 100%;
+  resize: vertical;
+  min-height: 60px;
+}
+.links-form-textarea:focus { border-color: var(--gold-mid); }
+.links-form-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+/* ── Create vault doc modal ──────────────────────────────────────────── */
+
+.links-create-vault-modal-inner {
+  width: 420px;
+  max-width: 92vw;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* ── Vault content edit modal ────────────────────────────────────────── */
+
+.links-vault-edit-modal-inner {
+  width: 760px;
+  max-width: 94vw;
+  height: 78vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.links-vault-edit-textarea {
+  flex: 1;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  padding: 10px 12px;
+  outline: none;
+  resize: none;
+  line-height: 1.6;
+  min-height: 0;
+}
+.links-vault-edit-textarea:focus { border-color: var(--gold-mid); }
