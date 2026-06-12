@@ -17,6 +17,9 @@ const VAULT_NAME = VAULT_PATH.split('/').pop();
 const LINKS_ENTITY_DIRS = {
   npcs:      '02 Characters/NPCs',
   locations: '01 World/Locations',
+  factions:  '01 World/Factions',
+  deities:   '05 Pantheon',
+  items:     '04 Items',
 };
 
 // ── RPGManager / Turso (direct — no server dependency) ───────────────────
@@ -221,6 +224,9 @@ document.getElementById('app').innerHTML = `
         <select class="tool-select links-type-select" id="links-type-select">
           <option value="npcs">NPCs</option>
           <option value="locations">Locations</option>
+          <option value="factions">Factions</option>
+          <option value="deities">Deities</option>
+          <option value="items">Items</option>
         </select>
         <input class="vault-search-input links-search-input" id="links-search" type="text" placeholder="Search…" autocomplete="off">
         <button class="btn btn-ghost" id="links-refresh-btn">↻ Refresh</button>
@@ -2050,6 +2056,9 @@ async function loadLinksTab(force = false) {
     const SQL = {
       npcs:      'SELECT id, name, pronunciation, race, gender, status, description FROM npcs ORDER BY name',
       locations: 'SELECT id, name, pronunciation, teaser, detail FROM locations ORDER BY name',
+      factions:  'SELECT id, name, pronunciation, type, status, location, description, goals, background FROM factions ORDER BY name',
+      deities:   'SELECT id, name, pronunciation, domain, alignment, status, description, symbol, church, tenets, lore FROM deities ORDER BY name',
+      items:     'SELECT id, name, category, pronunciation, type_tag, description, properties FROM items ORDER BY name',
     };
     const [entities, vaultRes] = await Promise.all([
       tursoQuery(SQL[_linksEntityType]),
@@ -2136,6 +2145,7 @@ function _renderLinksList() {
           </div>
           <div class="links-detail-col">
             <div class="links-detail-head">Vault</div>
+            ${linked ? `<div class="links-vault-title">${escapeHtml(linked.name)}</div>` : ''}
             <div class="links-vault-content" id="links-vault-db-${idStr}">
               ${linked ? '<span class="text-dim">Loading…</span>' : '<span class="links-unlinked-note">Not linked — click Link to connect a vault file.</span>'}
             </div>
@@ -2177,6 +2187,7 @@ function _renderLinksList() {
           </div>
           <div class="links-detail-col">
             <div class="links-detail-head">Vault</div>
+            <div class="links-vault-title">${escapeHtml(f.name)}</div>
             <div class="links-vault-content" id="links-vault-vaultonly-${idx}">
               <span class="text-dim">Loading…</span>
             </div>
@@ -2201,9 +2212,14 @@ function _renderLinksList() {
 }
 
 function _renderDbFields(entity) {
-  const keys = _linksEntityType === 'npcs'
-    ? ['name', 'pronunciation', 'race', 'gender', 'status', 'description']
-    : ['name', 'pronunciation', 'teaser', 'detail'];
+  const KEYS = {
+    npcs:      ['name', 'pronunciation', 'race', 'gender', 'status', 'description'],
+    locations: ['name', 'pronunciation', 'teaser', 'detail'],
+    factions:  ['name', 'pronunciation', 'type', 'status', 'location', 'description', 'goals', 'background'],
+    deities:   ['name', 'pronunciation', 'domain', 'alignment', 'status', 'description', 'symbol', 'church', 'tenets', 'lore'],
+    items:     ['name', 'category', 'pronunciation', 'type_tag', 'description', 'properties'],
+  };
+  const keys = KEYS[_linksEntityType] || ['name', 'description'];
   return keys
     .filter(k => entity[k])
     .map(k => `<div class="links-field">

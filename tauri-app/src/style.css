@@ -32,8 +32,8 @@ body {
   font-family: var(--font-body);
   height: 100vh;
   overflow: hidden;
-  user-select: none;
-  -webkit-user-select: none;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* Background noise texture using CSS */
@@ -1951,9 +1951,11 @@ details[open] .recap-summary::before { transform: rotate(90deg); }
   gap: 0;
   min-height: 120px;
   max-height: 340px;
+  overflow: hidden;
 }
 .links-detail-col {
   overflow-y: auto;
+  min-height: 0;
   padding: 12px 14px;
   scrollbar-width: thin;
 }
@@ -1988,6 +1990,13 @@ details[open] .recap-summary::before { transform: rotate(90deg); }
   font-size: 13px;
   color: var(--text-primary);
   line-height: 1.5;
+}
+
+.links-vault-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 10px;
 }
 
 .links-vault-content {
