@@ -5,6 +5,8 @@ from llama_index.core import Settings
 import chromadb
 import re
 import sys
+import time
+import errno
 from config import *
 import pickle
 import httpx
@@ -134,13 +136,35 @@ EXCLUDE_DIRS = [
 ]
 exclude_patterns = [str(OBSIDIAN_VAULT / d) + "/*" for d in EXCLUDE_DIRS]
 
-documents = SimpleDirectoryReader(
-    input_dir=OBSIDIAN_VAULT,
-    recursive=True,
-    required_exts=[".md"],
-    exclude=exclude_patterns,
-    exclude_hidden=True,
-).load_data()
+def load_documents_with_retry(attempts=5, delays=(2, 5, 15, 30, 60)):
+    """Load vault docs, retrying on transient iCloud Drive lock errors.
+
+    The vault lives under ~/Documents, which is iCloud-synced. When iCloud's
+    file provider daemon is mid-sync on a file, reading it can raise
+    OSError(EDEADLK, "Resource deadlock avoided") instead of just blocking.
+    This clears once the daemon releases the lock, so retry with backoff.
+    """
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            return SimpleDirectoryReader(
+                input_dir=OBSIDIAN_VAULT,
+                recursive=True,
+                required_exts=[".md"],
+                exclude=exclude_patterns,
+                exclude_hidden=True,
+            ).load_data()
+        except OSError as e:
+            if e.errno != errno.EDEADLK or attempt == attempts - 1:
+                raise
+            last_err = e
+            delay = delays[min(attempt, len(delays) - 1)]
+            print(f"iCloud lock hit ({e}), retrying in {delay}s "
+                  f"(attempt {attempt + 1}/{attempts})...", file=sys.stderr)
+            time.sleep(delay)
+    raise last_err
+
+documents = load_documents_with_retry()
 print(f"Loaded {len(documents)} documents")
 
 def get_category(file_path: str) -> str:
