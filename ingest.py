@@ -134,35 +134,46 @@ EXCLUDE_DIRS = [
     "00 To Process/LLM Chats",
     "03 Story/Sessions/DM Reviews",
 ]
-exclude_patterns = [str(OBSIDIAN_VAULT / d) + "/*" for d in EXCLUDE_DIRS]
 
 def load_documents_with_retry(attempts=5, delays=(2, 5, 15, 30, 60)):
-    """Load vault docs, retrying on transient iCloud Drive lock errors.
+    """Load vault docs file-by-file, retrying individual files on iCloud Drive lock errors.
 
-    The vault lives under ~/Documents, which is iCloud-synced. When iCloud's
-    file provider daemon is mid-sync on a file, reading it can raise
-    OSError(EDEADLK, "Resource deadlock avoided") instead of just blocking.
-    This clears once the daemon releases the lock, so retry with backoff.
+    Loading the entire directory at once means one locked file blocks everything.
+    Per-file loading isolates retries so only the locked file waits.
     """
-    last_err = None
-    for attempt in range(attempts):
-        try:
-            return SimpleDirectoryReader(
-                input_dir=OBSIDIAN_VAULT,
-                recursive=True,
-                required_exts=[".md"],
-                exclude=exclude_patterns,
-                exclude_hidden=True,
-            ).load_data()
-        except OSError as e:
-            if e.errno != errno.EDEADLK or attempt == attempts - 1:
-                raise
-            last_err = e
-            delay = delays[min(attempt, len(delays) - 1)]
-            print(f"iCloud lock hit ({e}), retrying in {delay}s "
-                  f"(attempt {attempt + 1}/{attempts})...", file=sys.stderr)
-            time.sleep(delay)
-    raise last_err
+    def is_excluded(path):
+        for excl_dir in EXCLUDE_DIRS:
+            try:
+                path.relative_to(OBSIDIAN_VAULT / excl_dir)
+                return True
+            except ValueError:
+                pass
+        return False
+
+    all_files = [
+        p for p in sorted(OBSIDIAN_VAULT.rglob("*.md"))
+        if not any(part.startswith(".") for part in p.parts)
+        and not is_excluded(p)
+    ]
+
+    documents = []
+    for file_path in all_files:
+        for attempt in range(attempts):
+            try:
+                docs = SimpleDirectoryReader(input_files=[file_path]).load_data()
+                documents.extend(docs)
+                break
+            except OSError as e:
+                if e.errno != errno.EDEADLK or attempt == attempts - 1:
+                    raise
+                delay = delays[min(attempt, len(delays) - 1)]
+                print(
+                    f"iCloud lock hit on {file_path.name} ({e}), retrying in {delay}s "
+                    f"(attempt {attempt + 1}/{attempts})...",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+    return documents
 
 documents = load_documents_with_retry()
 print(f"Loaded {len(documents)} documents")
