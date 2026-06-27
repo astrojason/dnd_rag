@@ -13,6 +13,8 @@ OBSIDIAN_VAULT = Path(os.getenv("OBSIDIAN_VAULT", "/Users/jasonsylvester/Library
 PROJECT_ROOT = Path(__file__).parent
 CHROMA_DB_PATH = PROJECT_ROOT / "data" / "chroma_db"
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
 # Models
 EMBED_MODEL = "nomic-embed-text"  # you'll need: ollama pull nomic-embed-text
 FAST_MODEL = "llama3.2:3b"

@@ -91,8 +91,22 @@ def table_to_prose(text):
     
     return '\n'.join(result)
 
+def _check_ollama() -> None:
+    try:
+        httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3.0)
+    except Exception:
+        print(
+            f"Error: Ollama server is not reachable at {OLLAMA_BASE_URL}.\n"
+            "Make sure Ollama is running and you are on the correct network.\n"
+            "Set the OLLAMA_HOST environment variable if using a non-default address.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+_check_ollama()
+
 print("Configuring LLM...")
-Settings.llm = Ollama(model=QUALITY_MODEL, request_timeout=300.0)
+Settings.llm = Ollama(model=QUALITY_MODEL, base_url=OLLAMA_BASE_URL, request_timeout=300.0)
 print("LLM configured")
 
 print("Configuring embeddings...")
@@ -123,7 +137,7 @@ if USE_OPENAI_EMBEDDINGS:
     print("Using OpenAI embeddings")
 else:
     from llama_index.embeddings.ollama import OllamaEmbedding
-    Settings.embed_model = OllamaEmbedding(model_name=EMBED_MODEL)
+    Settings.embed_model = OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
     print("Using local embeddings")
 
 print("Loading documents...")
