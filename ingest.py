@@ -178,8 +178,14 @@ def load_documents_with_retry(attempts=5, delays=(2, 5, 15, 30, 60)):
                 documents.extend(docs)
                 break
             except OSError as e:
-                if e.errno != errno.EDEADLK or attempt == attempts - 1:
+                if e.errno != errno.EDEADLK:
                     raise
+                if attempt == attempts - 1:
+                    print(
+                        f"Skipping {file_path} after {attempts} attempts, still iCloud-locked ({e})",
+                        file=sys.stderr,
+                    )
+                    break
                 delay = delays[min(attempt, len(delays) - 1)]
                 print(
                     f"iCloud lock hit on {file_path.name} ({e}), retrying in {delay}s "
