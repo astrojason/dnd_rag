@@ -686,6 +686,22 @@ async def query_endpoint(req: QueryRequest):
     return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.get("/changelog")
+async def changelog():
+    import subprocess, os
+    result = subprocess.run(
+        ['git', 'log', '--pretty=format:%h|%s|%ad', '--date=short', '-n', '50'],
+        capture_output=True, text=True, cwd=os.path.dirname(os.path.abspath(__file__))
+    )
+    entries = []
+    for line in result.stdout.strip().split('\n'):
+        if '|' in line:
+            parts = line.split('|', 2)
+            entries.append({'hash': parts[0], 'message': parts[1], 'date': parts[2] if len(parts) > 2 else ''})
+    version = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VERSION')).read().strip()
+    return {'version': version, 'entries': entries}
+
+
 @app.post("/reload")
 async def reload_endpoint():
     """Trigger a background reload of the ChromaDB index."""

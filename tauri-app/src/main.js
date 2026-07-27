@@ -77,6 +77,7 @@ document.getElementById('app').innerHTML = `
     <div class="header-title" id="header-title">
       <span class="header-icon">⚔</span>
       <span class="header-name">Azorian's Bounty Oracle</span>
+      <button class="tab-btn version-badge" id="version-badge" title="View changelog" style="font-size:0.75em;padding:2px 8px;margin-left:8px;opacity:0.7;">v—</button>
     </div>
     <div class="header-controls">
       <div class="status-badge">
@@ -94,6 +95,7 @@ document.getElementById('app').innerHTML = `
         <button class="tab-btn" data-tab="session">📜 Session</button>
         <button class="tab-btn" data-tab="vault">📖 Vault</button>
         <button class="tab-btn" data-tab="links">🔗 Links</button>
+        <button class="tab-btn" data-tab="changelog">📋 Changelog</button>
       </nav>
       <main class="chat-area tab-panel" id="panel-oracle">
         <div class="content-overlay" id="content-overlay">
@@ -252,6 +254,15 @@ document.getElementById('app').innerHTML = `
       <div class="links-status" id="links-status">—</div>
       <div class="links-list" id="links-list">
         <div class="vault-placeholder">Select a tab to load entities.</div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-changelog" style="display:none">
+      <div class="vault-toolbar">
+        <span class="vault-status-text" id="changelog-version">—</span>
+      </div>
+      <div id="changelog-list" style="padding:12px 16px;overflow-y:auto;font-family:monospace;font-size:0.875rem;">
+        <div class="vault-placeholder">Loading changelog…</div>
       </div>
     </div>
 
@@ -1418,6 +1429,20 @@ async function initTokens() {
 }
 initTokens();
 
+// Fetch version from /changelog on startup to populate the badge
+async function initVersion() {
+  try {
+    const res = await fetch(`${API}/changelog`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const badge = document.getElementById('version-badge');
+    if (badge && data.version) badge.textContent = `v${data.version}`;
+  } catch {
+    setTimeout(initVersion, 5000);
+  }
+}
+initVersion();
+
 // ── Tab navigation ─────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -1429,8 +1454,50 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (tab === 'session') loadSessionTab();
     if (tab === 'vault') loadVaultTab();
     if (tab === 'links') loadLinksTab();
+    if (tab === 'changelog') loadChangelogTab();
   });
 });
+
+// ── Changelog ──────────────────────────────────────────────────────────
+let _changelogLoaded = false;
+
+function switchToChangelog() {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'changelog'));
+  document.querySelectorAll('.tab-panel').forEach(p => { p.style.display = 'none'; });
+  document.getElementById('panel-changelog').style.display = '';
+  loadChangelogTab();
+}
+
+async function loadChangelogTab() {
+  if (_changelogLoaded) return;
+  const listEl = document.getElementById('changelog-list');
+  const versionEl = document.getElementById('changelog-version');
+  listEl.innerHTML = '<div class="vault-placeholder">Loading changelog…</div>';
+  try {
+    const res = await fetch(`${API}/changelog`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    _changelogLoaded = true;
+    if (versionEl) versionEl.textContent = `v${data.version}`;
+    document.getElementById('version-badge').textContent = `v${data.version}`;
+    const entries = data.entries || [];
+    if (entries.length === 0) {
+      listEl.innerHTML = '<div class="vault-placeholder">No changelog entries found.</div>';
+      return;
+    }
+    listEl.innerHTML = entries.map(e =>
+      `<div style="margin-bottom:0.5rem;line-height:1.6">` +
+      `<span style="opacity:0.6">${escapeHtml(e.date)}</span> ` +
+      `<code style="background:rgba(200,151,42,0.12);padding:0.1em 0.4em;border-radius:3px">${escapeHtml(e.hash)}</code> ` +
+      `${escapeHtml(e.message)}` +
+      `</div>`
+    ).join('');
+  } catch (err) {
+    listEl.innerHTML = `<div style="color:#c04040">Failed to load changelog: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+document.getElementById('version-badge').addEventListener('click', switchToChangelog);
 
 // ── Active PC names ────────────────────────────────────────────────────
 async function getActivePcNames() {
